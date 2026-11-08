@@ -1,0 +1,380 @@
+# Place this file at .github/workflows/orion-arm64-replay.yml in an empty public lab repo.
+# Adding the file starts the two cases. Later replays can be started from the Actions tab.
+# Only disposable synthetic databases enter the offline test containers.
+name: Orion ARM64 Doctor replay
+on:
+  push:
+    paths:
+      - '.github/workflows/orion-arm64-replay.yml'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  replay:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    steps:
+      - name: Build the pinned beta and legacy v25 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          build_dir="$(mktemp -d "$RUNNER_TEMP/orion-doctor.XXXXXX")"
+          cd "$build_dir"
+          cat > Dockerfile <<'ORION_END_FILE'
+          # syntax=docker/dockerfile:1
+          FROM debian:bookworm-slim AS runtime
+          SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+          RUN test "$(dpkg --print-architecture)" = arm64 && apt-get update && \
+              apt-get install -y --no-install-recommends ca-certificates curl xz-utils git python3 make g++ libatomic1 passwd && \
+              rm -rf /var/lib/apt/lists/* && \
+              curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v26.12.1/node-v26.12.1-linux-arm64.tar.xz && \
+              echo '42aa04922591ee5d4dbc7740d452621acf28508239daa512f5ee8c47ee224fdb  /tmp/node.tar.xz' | sha256sum -c - && \
+              tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 && rm /tmp/node.tar.xz && \
+              test "$(node -p 'process.arch + "/" + process.version')" = arm64/v26.12.1 && \
+              groupadd --gid 10001 replay && useradd --uid 10001 --gid replay --create-home --home-dir /home/replay replay
+          ENV OPENCLAW_STATE_DIR=/home/replay/.openclaw OPENCLAW_CONFIG_PATH=/home/replay/.openclaw/openclaw.json
+
+          FROM runtime AS legacy
+          RUN npm install --prefix /opt/legacy --omit=dev --no-audit --no-fund openclaw@2026.10.9 && npm cache clean --force
+          COPY seed.mjs snapshot.mjs /opt/lab/
+          RUN install -d -o replay -g replay /fixture
+          USER replay
+          ENV HOME=/home/replay
+          WORKDIR /home/replay
+          RUN --network=none node /opt/lab/seed.mjs && node /opt/lab/snapshot.mjs
+
+          FROM runtime
+          RUN mkdir -p /opt/beta /opt/trace && cd /tmp && \
+              npm pack --ignore-scripts --silent openclaw@2026.11.5-beta.1 && \
+              echo 'cc6d3b105b938acaf9301f17daa3985acd29fce0  openclaw-2026.11.5-beta.1.tgz' | sha1sum -c - && \
+              npm install --prefix /opt/beta --omit=dev --no-audit --no-fund /tmp/openclaw-2026.11.5-beta.1.tgz && \
+              npm install --prefix /opt/trace --ignore-scripts --no-audit --no-fund acorn@8.15.0 && \
+              rm /tmp/openclaw-2026.11.5-beta.1.tgz && npm cache clean --force
+          COPY --from=legacy --chown=replay:replay /fixture/ /fixture/
+          COPY instrument.cjs probe-helpers.js run.sh report.mjs /opt/lab/
+          RUN --network=none NODE_PATH=/opt/trace/node_modules node /opt/lab/instrument.cjs
+          USER replay
+          ENV HOME=/home/replay CI=1
+          WORKDIR /home/replay
+          ENTRYPOINT ["/bin/bash", "/opt/lab/run.sh"]
+          ORION_END_FILE
+          cat > seed.mjs <<'ORION_END_FILE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { openOpenClawAgentDatabase } from '/opt/legacy/node_modules/openclaw/dist/plugin-sdk/sqlite-runtime.js';
+
+          const state = process.env.OPENCLAW_STATE_DIR;
+          const agentDir = path.join(state, 'agents/main/agent');
+          fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+          fs.mkdirSync(path.join(state, 'workspace'), { recursive: true, mode: 0o700 });
+          const config = {
+            gateway: { mode: 'local', auth: { mode: 'token', token: 'synthetic-doctor-replay-token' } },
+            agents: { list: [{ id: 'main', default: true }] },
+            plugins: { enabled: false },
+          };
+          fs.writeFileSync(process.env.OPENCLAW_CONFIG_PATH, JSON.stringify(config), { mode: 0o600 });
+          const agent = openOpenClawAgentDatabase({ agentId: 'main', env: process.env });
+          assert.equal(agent.path, path.join(agentDir, 'openclaw-agent.sqlite'));
+          assert.equal(agent.db.prepare('PRAGMA user_version').get().user_version, 25);
+          assert.ok(agent.db.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE type='table'").get().n > 1);
+          // Opening through the legacy SDK also registers the agent in the shared database.
+          assert.ok(fs.statSync(path.join(state, 'state/openclaw.sqlite')).isFile());
+          // Commit is complete. Exit hooks close the legacy handles before snapshot.mjs opens SQLite.
+          process.exit(0);
+          ORION_END_FILE
+          cat > snapshot.mjs <<'ORION_END_FILE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { DatabaseSync, backup } from 'node:sqlite';
+
+          const root = process.env.OPENCLAW_STATE_DIR;
+          for (const file of ['state/openclaw.sqlite', 'agents/main/agent/openclaw-agent.sqlite']) {
+            const dest = path.join('/fixture', file);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            const db = new DatabaseSync(path.join(root, file), { readOnly: true });
+            try {
+              assert.equal(db.prepare('PRAGMA quick_check').get().quick_check, 'ok');
+              const version = db.prepare('PRAGMA user_version').get().user_version;
+              if (file.includes('openclaw-agent')) {
+                assert.equal(version, 25);
+              } else {
+                assert.ok(db.prepare("SELECT 1 FROM agent_databases WHERE agent_id='main' AND schema_version=25").get());
+              }
+              await backup(db, dest);
+              console.log('FIXTURE', file, 'schema', version);
+            } finally {
+              db.close();
+            }
+          }
+          fs.copyFileSync(process.env.OPENCLAW_CONFIG_PATH, '/fixture/openclaw.json');
+          ORION_END_FILE
+          cat > probe-helpers.js <<'ORION_END_FILE'
+          // Inserted into temporary copies of the beta's emitted JavaScript.
+          function orionReplayWrite(record) {
+            const { threadId, isMainThread } = process.getBuiltinModule('node:worker_threads');
+            const fs = process.getBuiltinModule('node:fs');
+            fs.appendFileSync('/tmp/orion-replay.jsonl',
+              JSON.stringify({ ...record, pid: process.pid, tid: threadId, main: isMainThread }) + '\n',
+              { mode: 0o600 });
+          }
+
+          function orionReplayCaller(bundle) {
+            try {
+              const { threadId, isMainThread } = process.getBuiltinModule('node:worker_threads');
+              const sites = process.getBuiltinModule('node:util').getCallSites(24, { sourceMap: false });
+              const frames = sites.slice(1).map(site => site.functionName)
+                .filter(name => /^[\w$.-]{1,90}$/.test(name));
+              const id = process.getBuiltinModule('node:crypto').randomUUID();
+              const marker = '[ORION_CALLER id=' + id + ' pid=' + process.pid + ' tid=' + threadId +
+                ' main=' + Number(isMainThread) + ' bundle=' + bundle + ' frames=' + frames.join('>') + ']';
+              orionReplayWrite({ event: 'guard', id, bundle, frames });
+              return ' ' + marker;
+            } catch {
+              return ' [ORION_CALLER capture-unavailable]';
+            }
+          }
+
+          function orionReplayPidPath(bundle) {
+            const fs = process.getBuiltinModule('node:fs');
+            const absent = fs.existsSync('/home/replay/.simulate-missing-pid-link');
+            const selected = absent ? '/proc/self/ns/orion_replay_missing_pid' : '/proc/self/ns/pid';
+            try {
+              const seen = globalThis[Symbol.for('orion.replay.namespace.proofs')] ??= new Set();
+              if (!seen.has(bundle)) {
+                seen.add(bundle);
+                const result = fn => {
+                  try { fn(selected); return 'ok'; } catch (error) { return error.code || error.name; }
+                };
+                orionReplayWrite({ event: 'namespace', bundle, selected,
+                  readlink: result(fs.readlinkSync), stat: result(fs.statSync) });
+              }
+            } catch { /* Observation is best effort. The original reader still runs. */ }
+            return selected;
+          }
+
+          function orionReplayDoctorError(boundary, error) {
+            try {
+              const seen = new Map();
+              function pack(value) {
+                if (!value || typeof value !== 'object') return { value: String(value) };
+                if (seen.has(value)) return { ref: seen.get(value) };
+                const id = seen.size;
+                seen.set(value, id);
+                const node = { id, name: String(value.name || 'Error'), message: String(value.message ?? value) };
+                if (typeof value.stack === 'string') node.stack = value.stack;
+                if (typeof value.code === 'number' || typeof value.code === 'string') node.code = value.code;
+                if ('cause' in value && value.cause !== undefined) node.cause = pack(value.cause);
+                if (Array.isArray(value.errors)) node.errors = value.errors.map(pack);
+                return node;
+              }
+              orionReplayWrite({ event: 'doctor-error', boundary, error: pack(error) });
+            } catch { /* Preserve the exception already in flight. */ }
+          }
+          ORION_END_FILE
+          cat > instrument.cjs <<'ORION_END_FILE'
+          'use strict';
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const acorn = require('acorn');
+          const pkg = process.argv[2] || '/opt/beta/node_modules/openclaw';
+          const { name, version } = JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8'));
+          if (name !== 'openclaw' || version !== '2026.11.5-beta.1') throw Error('Unexpected package');
+          const dist = path.join(pkg, 'dist');
+          const helpers = fs.readFileSync(path.join(__dirname, 'probe-helpers.js'), 'utf8');
+          const guardBundles = new Set();
+          const nsBundles = new Set();
+          let doctors = 0;
+          let innerCatches = 0;
+
+          function* sources(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory() && entry.name !== 'node_modules') yield* sources(file);
+              else if (entry.isFile() && /\.(?:js|mjs|cjs)$/.test(file)) yield file;
+            }
+          }
+          function* descendants(node) {
+            yield node;
+            for (const value of Object.values(node)) {
+              if (Array.isArray(value)) {
+                for (const child of value) if (child && typeof child.type === 'string') yield* descendants(child);
+              } else if (value && typeof value.type === 'string') {
+                yield* descendants(value);
+              }
+            }
+          }
+
+          for (const file of sources(dist)) {
+            const bundle = path.relative(dist, file);
+            const literal = JSON.stringify(bundle);
+            const input = fs.readFileSync(file, 'utf8');
+            const edits = [];
+            if (input.includes(' is undergoing offline maintenance by ') &&
+                input.includes('assertPersistedStateDatabaseAccessAllowed')) {
+              const assignment = /^([ \t]*(?:const|let|var) maintenancePending(?:\$\d+)? = \x60OpenClaw state at [^\r\n]* is undergoing offline maintenance by [^\r\n]*\x60);[ \t]*$/gm;
+              const hits = [...input.matchAll(assignment)];
+              if (!hits.length) throw Error('Unrecognized refusal template in ' + bundle);
+              for (const hit of hits) {
+                const end = hit.index + hit[1].length;
+                edits.push([end, end, ' + orionReplayCaller(' + literal + ')']);
+              }
+              guardBundles.add(bundle);
+            }
+            const declaration = /\b(?:async\s+)?function\s+(readGatewayLockProcessNamespace|doctorCommand)(?:\$\d+)?\s*\(/g;
+            for (const hit of input.matchAll(declaration)) {
+              const fn = acorn.parseExpressionAt(input, hit.index, { ecmaVersion: 'latest', sourceType: 'module' });
+              if (fn.type !== 'FunctionExpression') throw Error('Unexpected declaration in ' + bundle);
+              const body = fn.body;
+              if (hit[1] === 'readGatewayLockProcessNamespace') {
+                const calls = [...descendants(body)].filter(n => n.type === 'CallExpression' &&
+                  ['readlinkSync', 'statSync'].includes(n.callee.property?.name) &&
+                  n.arguments[0]?.value === '/proc/self/ns/pid');
+                if (input.slice(body.start, body.end).includes('/proc/self/ns/pid') && !calls.length) {
+                  throw Error('Unrecognized PID probe in ' + bundle);
+                }
+                for (const call of calls) {
+                  const arg = call.arguments[0];
+                  edits.push([arg.start, arg.end, 'orionReplayPidPath(' + literal + ')']);
+                  nsBundles.add(bundle);
+                }
+              } else {
+                const source = input.slice(body.start, body.end);
+                if (!/runDoctorHealthFlow|diagnoseDoctorStateStorageFailure|openclaw doctor --fix/.test(source)) continue;
+                edits.push([body.start + 1, body.start + 1,
+                  '\ntry { orionReplayWrite({event:"doctor-enter"}); } catch {} \ntry {\n']);
+                edits.push([body.end - 1, body.end - 1,
+                  '\n} catch (orionReplayFailure) { orionReplayDoctorError("doctor-out", orionReplayFailure); throw orionReplayFailure; }\n']);
+                for (const block of body.body) {
+                  if (block.type !== 'TryStatement' || block.handler?.param?.type !== 'Identifier') continue;
+                  if (!/runDoctorHealthFlow|diagnoseDoctorStateStorageFailure/.test(input.slice(block.start, block.end))) continue;
+                  const pos = block.handler.body.start + 1;
+                  edits.push([pos, pos, '\norionReplayDoctorError("health-flow", ' + block.handler.param.name + ');\n']);
+                  innerCatches++;
+                }
+                doctors++;
+              }
+            }
+            if (edits.length) {
+              let output = input;
+              for (const [from, to, text] of edits.sort((a, b) => b[0] - a[0])) {
+                output = output.slice(0, from) + text + output.slice(to);
+              }
+              fs.writeFileSync(file, output + '\n' + helpers + '\n');
+            }
+          }
+          for (const expected of ['gateway-state-owner-DQ8gMS4R.mjs', 'state/openclaw-state-lease-heartbeat.worker.js']) {
+            if (!guardBundles.has(expected)) throw Error('Missing known guard: ' + expected);
+          }
+          if (!nsBundles.size) throw Error('Could not locate the Linux PID namespace reader');
+          if (!doctors) throw Error('Could not instrument the Doctor command boundary');
+          console.log('PROBE_READY', JSON.stringify({ guardBundles: guardBundles.size, pidReaders: nsBundles.size, doctors, innerCatches }));
+          ORION_END_FILE
+          cat > run.sh <<'ORION_END_FILE'
+          set -euo pipefail
+          mode="$1"
+          case "$mode" in
+            control) ;;
+            missing) touch /home/replay/.simulate-missing-pid-link ;;
+            *) exit 2 ;;
+          esac
+          test "$(id -u)" -ne 0
+          test "$(node -p 'process.arch + "/" + process.version')" = arm64/v26.12.1
+          umask 077
+          mkdir -p "$OPENCLAW_STATE_DIR/workspace"
+          cp -R /fixture/. "$OPENCLAW_STATE_DIR/"
+          node --input-type=module - <<'JS'
+          import { DatabaseSync } from 'node:sqlite';
+          import { join } from 'node:path';
+          import assert from 'node:assert/strict';
+          const db = new DatabaseSync(join(process.env.OPENCLAW_STATE_DIR, 'agents/main/agent/openclaw-agent.sqlite'), {readOnly:true});
+          assert.equal(db.prepare('PRAGMA user_version').get().user_version, 25);
+          assert.equal(db.prepare('PRAGMA quick_check').get().quick_check, 'ok');
+          db.close();
+          JS
+          set +e
+          timeout --kill-after=15s 8m node /opt/beta/node_modules/openclaw/openclaw.mjs doctor --fix --non-interactive \
+            > /tmp/orion-doctor-output.log 2>&1
+          doctor_rc=$?
+          set -e
+          node /opt/lab/report.mjs "$mode" "$doctor_rc"
+          ORION_END_FILE
+          cat > report.mjs <<'ORION_END_FILE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { DatabaseSync } from 'node:sqlite';
+          const [mode, rawExit] = process.argv.slice(2);
+          const doctorExit = Number(rawExit);
+          const trace = '/tmp/orion-replay.jsonl';
+          const events = fs.existsSync(trace) ? fs.readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+          const errors = events.filter(e => e.event === 'doctor-error');
+          const guards = events.filter(e => e.event === 'guard');
+          const proofs = events.filter(e => e.event === 'namespace');
+          const entered = events.some(e => e.event === 'doctor-enter');
+          const expected = mode === 'missing' ? 'ENOENT' : 'ok';
+          const observed = proofs.length > 0 && proofs.every(e => e.readlink === expected && e.stat === expected);
+          const root = process.env.OPENCLAW_STATE_DIR;
+          let after = null;
+          let integrity = null;
+          try {
+            const db = new DatabaseSync(path.join(root, 'agents/main/agent/openclaw-agent.sqlite'), {readOnly:true});
+            try {
+              after = db.prepare('PRAGMA user_version').get().user_version;
+              integrity = db.prepare('PRAGMA quick_check').get().quick_check;
+            } finally { db.close(); }
+          } catch (error) { console.log('SCHEMA_READ_ERROR', error.message); }
+
+          function messages(node) {
+            if (!node) return [];
+            return [node.message || '', ...messages(node.cause), ...(node.errors || []).flatMap(messages)];
+          }
+          const returnedMessages = errors.filter(e => e.boundary === 'doctor-out').flatMap(e => messages(e.error));
+          const correlated = guards.filter(g => returnedMessages.some(m => m.includes('[ORION_CALLER id=' + g.id + ' ')));
+          let outcome = 'inconclusive';
+          if (doctorExit === 124 || doctorExit === 137) outcome = 'timeout';
+          else if (observed && entered && doctorExit === 0 && after === 38 && integrity === 'ok') outcome = 'migrated-to-38';
+          else if (observed && entered && doctorExit !== 0 && correlated.length > 0) outcome = 'maintenance-refusal-reached-doctor';
+          const summary = {mode, doctorExit, entered, observedPidCondition: observed, before:25, after, integrity,
+            guardHits:guards.length, correlated:correlated.map(g => ({id:g.id, main:g.main, bundle:g.bundle, frames:g.frames})), outcome};
+          console.log('RESULT ' + JSON.stringify(summary));
+          for (const e of proofs) console.log('PID_PROBE ' + JSON.stringify(e));
+          for (const e of guards) console.log('GUARD ' + JSON.stringify(e));
+          for (const e of errors) console.log('FULL_ERROR ' + JSON.stringify(e));
+          // Include CLI context for errors raised before Doctor, or for a setup refusal.
+          if (outcome !== 'migrated-to-38') {
+            const file = '/tmp/orion-doctor-output.log';
+            if (fs.existsSync(file)) {
+              for (const line of fs.readFileSync(file, 'utf8').trimEnd().split('\n').slice(-50)) console.log('CLI | ' + line);
+            }
+          }
+          const valid = mode === 'control' ? outcome === 'migrated-to-38' :
+            ['migrated-to-38', 'maintenance-refusal-reached-doctor'].includes(outcome);
+          if (!valid) process.exitCode = 2;
+          ORION_END_FILE
+          DOCKER_BUILDKIT=1 docker build --progress=plain -t orion-doctor-lab:replay .
+      - name: Compare both offline Doctor runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          for mode in control missing; do
+            log="$RUNNER_TEMP/orion-$mode.log"
+            echo "::group::Doctor replay - $mode"
+            if ! docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+              --read-only --pids-limit=512 \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+              --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+              orion-doctor-lab:replay "$mode" 2>&1 | tee "$log"; then
+              status=1
+            fi
+            echo "::endgroup::"
+            if grep -q '^RESULT ' "$log"; then
+              grep '^RESULT ' "$log" | sed 's/^RESULT //' | jq -r '"* **" + .mode + "** — " + .outcome + " (Doctor exit " + (.doctorExit|tostring) + ", agent schema " + (.before|tostring) + " → " + (.after|tostring) + ")"' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "* **$mode** — no replay result. See the job log." >> "$GITHUB_STEP_SUMMARY"
+              status=1
+            fi
+          done
+          exit "$status"
