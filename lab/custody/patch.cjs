@@ -58,21 +58,27 @@ for (const file of files) {
     }
   }
   if (code.includes('checkFreshAdmission') &&
-      (code.includes('Shared-state read transport is closed') || code.includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath'))) {
+      (code.includes('Shared-state read transport is closed') || code.includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath') || bundle.startsWith('state/openclaw-state-read'))) {
     const tree=acorn.parse(code,parseOptions);
     const nodes=[...walk(tree)];
     for (const n of nodes) {
-      if (n.type !== 'IfStatement' || n.test.type !== 'MemberExpression' ||
-          n.test.property?.name !== 'checkFreshAdmission' || n.consequent.type!=='BlockStatement' ||
-          !slice(n.consequent).includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath')) continue;
-      const input=slice(n.test.object);
-      insert(n.consequent.start+1,'\n'+worker+'.run('+input+'.orionReadTicket, () => {\n');
-      insert(n.consequent.end-1,'\n});\n');
+      const test=n.type==='IfStatement'?n.test:n.type==='LogicalExpression' && n.operator==='&&'?n.left:undefined;
+      if (test?.type!=='MemberExpression' || test.property?.name!=='checkFreshAdmission') continue;
+      const branch=n.type==='IfStatement'?n.consequent:n.right;
+      console.log('FRESH_CHECK',bundle,branch.type,slice(branch).slice(0,210).replace(/\s+/g,' '));
+      if(!slice(branch).includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath')) continue;
+      const prefix=worker+'.run('+slice(test.object)+'.orionReadTicket, () => ';
+      if(n.type==='IfStatement') {
+        edits.push([branch.start,branch.end,'{ '+prefix+'{ '+slice(branch)+'\n }); }']);
+      } else {
+        edits.push([branch.start,branch.end,prefix+'('+slice(branch)+'))']);
+      }
       stats.readWorker++;
     }
     for (const method of nodes.filter(n=>n.type==='MethodDefinition' && propName(n)==='startRun')) {
       const body=method.value.body;
       if(!slice(body).includes('Shared-state read transport is closed')) continue;
+      if(bundle!=='openclaw-state-read-worker-JxBMB6A1.mjs') continue;
       const [context,,fresh,,authority]=method.value.params.map(n=>n.name);
       if(!context || !authority || !fresh) throw Error('Unrecognized read transport parameters');
       const inside=[...walk(body)];
