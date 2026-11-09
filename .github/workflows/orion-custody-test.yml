@@ -1,0 +1,62 @@
+name: Test maintenance custody on ARM64
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/orion-custody-test.yml'
+      - 'lab/custody/**'
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build identical fixture and package variants
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$RUNNER_TEMP/orion-base"
+          docker build --progress=plain -t orion-doctor-lab:baseline "$RUNNER_TEMP/orion-base"
+          docker build --progress=plain -t orion-doctor-lab:candidate lab/custody
+      - name: Check owner isolation and run both variants
+        run: |
+          set -euo pipefail
+          status=0
+          run_case() {
+            local variant="$1" mode="$2" log="$RUNNER_TEMP/orion-$1-$2.log"
+            echo "::group::$variant / $mode"
+            if ! docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+                --security-opt=no-new-privileges --read-only --pids-limit=512 \
+                --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+                --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+                "orion-doctor-lab:$variant" "$mode" 2>&1 | tee "$log"; then
+              status=1
+            fi
+            if [[ "$mode" != safeguards ]]; then
+              local expected=migrated-to-38
+              if [[ "$variant/$mode" == baseline/missing ]]; then expected=maintenance-refusal-reached-doctor; fi
+              local result
+              result="$(sed -n 's/^RESULT //p' "$log")"
+              if [[ -n "$result" ]]; then
+                jq -r --arg lab "$variant/$mode" '"* **"+$lab+"** — "+.outcome+" (agent schema "+(.after|tostring)+")"' <<<"$result" >> "$GITHUB_STEP_SUMMARY"
+                if ! jq -e --arg expected "$expected" '.outcome==$expected and .observedPidCondition and .integrity=="ok"' <<<"$result" >/dev/null; then status=1; fi
+              else
+                echo "* $variant/$mode produced no Doctor result." >> "$GITHUB_STEP_SUMMARY"
+                status=1
+              fi
+            else
+              grep '^SAFEGUARD ' "$log" >> "$GITHUB_STEP_SUMMARY" || status=1
+            fi
+            echo "::endgroup::"
+          }
+          run_case candidate safeguards
+          run_case baseline control
+          run_case baseline missing
+          run_case candidate control
+          run_case candidate missing
+          exit "$status"
