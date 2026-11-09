@@ -75,16 +75,18 @@ export function issue(databasePath, scope, assertTask, signal, kind = 'read') {
         fs.closeSync(fd);
         fd = undefined;
       };
+      const recheck = () => scope.run(() => {
+          if (!grants.has(ticket) || getOpenClawDatabaseMaintenanceScope() !== scope) throw Error('task retired');
+          assertLive();
+          if (!sameFile() || digest(fs.readFileSync(file)) !== signature || !sameFile()) throw Error('owner file changed');
+          assertLive();
+          if (!grants.has(ticket)) throw Error('task retired');
+        });
       const verify = message => {
         if (message.db !== db || message.ownerPath !== file || message.ownerId !== owner.ownerId ||
-            message.hash !== signature || !sameFile()) return false;
-        return scope.run(() => {
-          if (getOpenClawDatabaseMaintenanceScope() !== scope) return false;
-          assertLive();
-          if (digest(fs.readFileSync(file)) !== signature || !sameFile()) return false;
-          assertLive();
-          return grants.has(ticket);
-        });
+            message.hash !== signature) return false;
+        recheck();
+        return true;
       };
       if (!listening) {
         process.on('workerMessage', serve);
@@ -93,7 +95,7 @@ export function issue(databasePath, scope, assertTask, signal, kind = 'read') {
       grants.set(ticket, {verify, kind});
       signal?.addEventListener('abort', close, {once:true});
       owner.signal.addEventListener('abort', close, {once:true});
-      grant = {ticket, close};
+      grant = {ticket, close, assertCurrent:recheck};
       record('issued', kind);
     });
   } catch (error) {

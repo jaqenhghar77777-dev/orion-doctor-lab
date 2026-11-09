@@ -61,18 +61,12 @@ for (const file of files) {
       (code.includes('Shared-state read transport is closed') || code.includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath') || bundle.startsWith('state/openclaw-state-read'))) {
     const tree=acorn.parse(code,parseOptions);
     const nodes=[...walk(tree)];
-    for (const n of nodes) {
-      const test=n.type==='IfStatement'?n.test:n.type==='LogicalExpression' && n.operator==='&&'?n.left:undefined;
-      if (test?.type!=='MemberExpression' || test.property?.name!=='checkFreshAdmission') continue;
-      const branch=n.type==='IfStatement'?n.consequent:n.right;
-      console.log('FRESH_CHECK',bundle,branch.type,slice(branch).slice(0,210).replace(/\s+/g,' '));
-      if(!slice(branch).includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath')) continue;
-      const prefix=worker+'.run('+slice(test.object)+'.orionReadTicket, () => ';
-      if(n.type==='IfStatement') {
-        edits.push([branch.start,branch.end,'{ '+prefix+'{ '+slice(branch)+'\n }); }']);
-      } else {
-        edits.push([branch.start,branch.end,prefix+'('+slice(branch)+'))']);
-      }
+    for (const decl of nodes.filter(n=>n.type==='VariableDeclarator' && /^executeRead(?:\$\d+)?$/.test(n.id.name))) {
+      const body=decl.init?.body;
+      if(body?.type!=='BlockStatement' || !slice(body).includes('assertOpenClawStateDatabaseFreshOpenAllowedAtPath')) continue;
+      const check=unique([...walk(body)].filter(n=>n.type==='MemberExpression' && n.property?.name==='checkFreshAdmission'),'fresh read predicate');
+      insert(body.start+1,'\nreturn '+worker+'.run('+slice(check.object)+'.orionReadTicket, async () => {\n');
+      insert(body.end-1,'\n});\n');
       stats.readWorker++;
     }
     for (const method of nodes.filter(n=>n.type==='MethodDefinition' && propName(n)==='startRun')) {
@@ -91,10 +85,10 @@ for (const file of files) {
       const original=slice(result.value);
       insert(0,'import { issue as orionLabIssue } from "file:///opt/lab/custody-host.mjs";\n');
       insert(body.start+1,'\nlet orionGrant; let orionFinished = false;\n');
-      insert(send.start,'if ('+fresh+' && !orionFinished && !orionGrant) {\n' +
+      insert(send.start,'if (!orionFinished && !orionGrant) {\n' +
         'orionGrant = orionLabIssue('+context+'.admission.databasePath, '+context+'.maintenanceScope, '+authority+'.assertCurrent, '+authority+'.signal, "read");\n' +
         'if (orionGrant) '+request+'.orionReadTicket = orionGrant.ticket;\n}\n');
-      edits.push([result.start,result.end,'result: '+original+'.finally(() => { orionFinished = true; orionGrant?.close(); })']);
+      edits.push([result.start,result.end,'result: '+original+'.then(value => { if (!("error" in value)) orionGrant?.assertCurrent(); return value; }).finally(() => { orionFinished = true; orionGrant?.close(); })']);
       stats.readBroker++;
     }
   }

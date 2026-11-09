@@ -66,7 +66,11 @@ try {
   fs.mkdirSync(path.dirname(file),{recursive:true});
   fs.writeFileSync(file,raw,{flag:'wx'});
   await expect('released-owner-replayed-record',false,live.ticket);
-  assert.equal(scope.run(()=>issue(db,scope,()=>{},new AbortController().signal)),undefined);
+  assert.equal(issue(db,scope,()=>{},new AbortController().signal),undefined);
+  const unrelated=createOpenClawDatabaseMaintenanceScope({schemaMaintenance:true});
+  try {
+    assert.equal(issue(db,unrelated,()=>{},new AbortController().signal),undefined);
+  } finally { await unrelated.close(); }
   console.log('SAFEGUARD foreign-record-cannot-mint refused');
 } finally {
   for(const grant of grants) grant.close();
