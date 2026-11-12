@@ -1,0 +1,44 @@
+name: Reopen a migrated synthetic Orion copy with the PID link missing
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/orion-offline-copy.yml'
+      - 'lab/offline-copy/**'
+permissions:
+  contents: read
+jobs:
+  restore:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build a populated synthetic v25 fixture and a pinned beta.2 runtime
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          ctx="$RUNNER_TEMP/orion-offline"
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$ctx"
+          python3 lab/release/replay.py "$ctx" 752decdb823486435d8884e655ecbe8fffdfa08c
+          python3 lab/offline-copy/prepare.py "$ctx"
+          docker build --progress=plain -t orion-doctor-lab:offline "$ctx"
+      - name: Migrate then reopen in two independent offline containers
+        run: |
+          set -euo pipefail
+          transfer="$(mktemp -d "$RUNNER_TEMP/orion-transfer.XXXXXX")"
+          chmod 0777 "$transfer"
+          for phase in prepare reopen; do
+            access=rw
+            if [[ "$phase" == reopen ]]; then access=ro; fi
+            log="$RUNNER_TEMP/offline-$phase.log"
+            docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+              --security-opt=no-new-privileges --read-only --pids-limit=512 \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+              --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+              -v "$transfer:/handoff:$access" --entrypoint /bin/bash \
+              orion-doctor-lab:offline /opt/lab/handoff.sh "$phase" 2>&1 | tee "$log"
+            grep -E '^(RESULT|SESSION|SESSIONS|GATEWAY|DATABASES|HANDOFF) ' "$log" >> "$GITHUB_STEP_SUMMARY"
+          done
