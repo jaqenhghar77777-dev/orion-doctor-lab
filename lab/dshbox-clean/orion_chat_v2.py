@@ -65,7 +65,8 @@ const fs=require('node:fs'), {DatabaseSync}=require('node:sqlite'),{zstdDecompre
 const db=new DatabaseSync(process.argv[1],{readOnly:true});
 try{
  db.exec('PRAGMA query_only=ON');
- const rows=db.prepare('SELECT event_json,event_zstd FROM transcript_events WHERE session_id=? ORDER BY seq').all(process.argv[2]);
+ if(!process.argv[2] && db.prepare('SELECT count(DISTINCT session_id) AS n FROM transcript_events').get().n>1)throw Error('MULTIPLE_AUDIT_SESSIONS');
+ const rows=db.prepare('SELECT event_json,event_zstd FROM transcript_events'+(process.argv[2]?' WHERE session_id=?':'')+' ORDER BY seq').all(...(process.argv[2]?[process.argv[2]]:[]));
  if(rows.length>20000)throw Error('AUDIT_LIMIT');
  process.stdout.write(JSON.stringify(rows.map(r=>JSON.parse(r.event_json??
     zstdDecompressSync(r.event_zstd,{maxOutputLength:16*1024*1024}).toString('utf8')))));
@@ -88,7 +89,7 @@ def events(state, session):
                 after = source.stat()
                 if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):
                     raise ValueError("history changed during audit")
-        run = subprocess.run([shutil.which("node"),"--no-warnings","--input-type=commonjs","-e",AUDIT,str(copy),session],
+        run = subprocess.run([shutil.which("node"),"--no-warnings","--input-type=commonjs","-e",AUDIT,str(copy)]+([session] if session else []),
                              cwd=tmp,env={"PATH":os.environ["PATH"],"HOME":tmp,"TMPDIR":tmp,
                                           "NODE_DISABLE_COMPILE_CACHE":"1"},capture_output=True,text=True,timeout=60)
         if run.returncode:
@@ -141,6 +142,11 @@ def tool_evidence(records, workspace):
     return summary
 
 
+def normalized_quote(value):
+    # Preserve words, punctuation and case. Line wrapping alone has no semantic effect.
+    return " ".join(value.split())
+
+
 def verify_reply(reply, evidence, user, note, nonce):
     payload = reply.strip()
     if payload.startswith("```"):
@@ -149,16 +155,16 @@ def verify_reply(reply, evidence, user, note, nonce):
     except ValueError: return {"reply_json":False}
     if not isinstance(answer,dict): return {"reply_json":False}
     def quote_match(value, content):
-        return isinstance(value,str) and len(value.strip())>=16 and value in content
+        return isinstance(value,str) and len(value.strip())>=16 and normalized_quote(value) in normalized_quote(content)
     reads = {}
     for item in evidence:
         if item["tool"].split(".")[-1]=="read" and item["status"]=="SUCCESS":
             reads.setdefault(item["target"],[]).append(item.get("_text",""))
     def from_read(quote, target):
-        return isinstance(quote,str) and any(quote in body for body in reads.get(target,[]))
+        return isinstance(quote,str) and any(normalized_quote(quote) in normalized_quote(body) for body in reads.get(target,[]))
     bodies = re.split(r"\n## Excerpt \d+\n\nSource [^\n]*\n\n",note)[1:]
     return {"reply_json":True,"user_read":"USER.md" in reads,"memory_read":NOTE in reads,
-            "proof_read":"read-proof.txt" in reads,"proof_value":answer.get("proof")==nonce and from_read(nonce,"read-proof.txt"),
+            "proof_read":"read-proof.txt" in reads,"proof_value":answer.get("proof")==nonce and any(nonce in body for body in reads.get("read-proof.txt",[])),
             "user_fact_quote":quote_match(answer.get("user_quote"),user) and from_read(answer.get("user_quote"),"USER.md"),
             "memory_excerpt_quote":any(quote_match(answer.get("memory_quote"),b) for b in bodies) and from_read(answer.get("memory_quote"),NOTE),
             "user_fact_identified":answer.get("user_fact")==answer.get("user_quote") and isinstance(answer.get("user_fact"),str),

@@ -135,6 +135,47 @@ class Checks(unittest.TestCase):
                 self.assertEqual((w/"MEMORY.md").exists(),mode=="success")
                 self.assertEqual((old/"read-verification-v2.json").exists(),mode=="success")
 
+    def test_line_wrap_equivalence_preserves_words_and_punctuation(self):
+        w=Path("/fiction")
+        wrapped=NOTE.replace("fictional orchard","fictional\norchard")
+        e=chat.tool_evidence(records(w,memory=wrapped),w)
+        self.assertTrue(all(chat.verify_reply(answer(),e,USER,wrapped,"fictional-proof").values()))
+        changed=json.loads(answer());changed["memory_quote"]=MEMORY.replace("three","four")
+        changed["memory_fact"]=changed["memory_quote"]
+        self.assertFalse(all(chat.verify_reply(json.dumps(changed),e,USER,wrapped,"fictional-proof").values()))
+
+    def test_saved_result_finalization_uses_no_model_and_preserves_original_report(self):
+        import finalize_read_v2 as finalizer
+        for variant in ("line-wrap","unsupported-quote"):
+            with self.subTest(variant=variant),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);old=root/"chat";source=old/"home/.openclaw/workspace"
+                test=root/"test";target=test/"home/.openclaw/workspace"
+                docs={n:"identity "+n for n in helper.HASHES}
+                docs["USER.md"]=USER;docs[chat.NOTE]=NOTE.replace("fictional orchard","fictional\norchard")
+                for workspace in (source,target):
+                    for name,value in docs.items():
+                        file=workspace/name;file.parent.mkdir(parents=True,exist_ok=True);file.write_text(value)
+                hashes={n:hashlib.sha256(value.encode()).hexdigest() for n,value in docs.items()}
+                (target/"read-proof.txt").write_text("fictional-proof\n")
+                original=json.dumps({"result":"READ_VERIFY_STOP","exit":0,"test_directory":str(test)}).encode()
+                (test/"verification-report.json").write_bytes(original)
+                saved=json.loads(answer())
+                if variant=="unsupported-quote":
+                    saved["memory_fact"]=saved["memory_quote"]="A completely unsupported memory claim."
+                (test/"reply.txt").write_text(json.dumps(saved))
+                db=target.parent/"agents/main/agent/openclaw-agent.sqlite";db.parent.mkdir(parents=True)
+                c=sqlite3.connect(db);c.execute("create table transcript_events(session_id,seq,event_json,event_zstd)")
+                for i,event in enumerate(records(target,memory=docs[chat.NOTE])):
+                    c.execute("insert into transcript_events values('only-session',?,?,null)",(i,json.dumps(event)))
+                c.commit();c.close()
+                with patch.object(chat,"CHAT",old),patch.object(helper,"HASHES",hashes),patch.object(chat,"HASHES",hashes),patch.object(chat,"call",side_effect=AssertionError("no inference")),contextlib.redirect_stdout(io.StringIO()) as out:
+                    rc=finalizer.finalize(test)
+                self.assertEqual(rc,0 if variant=="line-wrap" else 1)
+                report=json.loads(out.getvalue())
+                self.assertEqual(report["model_requests"],0)
+                self.assertEqual((test/"verification-report.json").read_bytes(),original)
+                self.assertEqual((old/"orion_chat_v2.py").exists(),variant=="line-wrap")
+
     def test_chat_submits_one_multiline_turn_and_keeps_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);w=root/"home/.openclaw/workspace";w.mkdir(parents=True)
