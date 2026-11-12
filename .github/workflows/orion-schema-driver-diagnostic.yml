@@ -1,0 +1,39 @@
+name: Diagnose schema driver on fictional data only
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/orion-schema-driver-diagnostic.yml'
+      - 'lab/schema-driver-diagnostic/prepare.py'
+permissions:
+  contents: read
+concurrency:
+  group: orion-fictional-driver-diagnostic
+  cancel-in-progress: false
+jobs:
+  fictional_diagnostic:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build the same pinned runtime with fictional diagnostic logging
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          context="$RUNNER_TEMP/orion-fictional-diagnostic-build"
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$context"
+          python3 lab/release/replay.py "$context" 752decdb823486435d8884e655ecbe8fffdfa08c
+          python3 lab/real-state-migration/build.py "$context"
+          python3 lab/schema-driver-diagnostic/prepare.py "$context"
+          docker build --progress=plain -t orion-fictional-diagnostic:v1 "$context"
+      - name: Reproduce the fictional driver failure once
+        run: |
+          set -euo pipefail
+          docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+            --security-opt=no-new-privileges --read-only --pids-limit=512 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+            --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+            -e ORION_FICTIONAL_DIAGNOSTIC=1 \
+            --entrypoint python3 orion-fictional-diagnostic:v1 /opt/real-lab/schema-selftest.py
