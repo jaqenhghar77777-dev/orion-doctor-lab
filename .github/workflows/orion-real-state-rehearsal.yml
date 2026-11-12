@@ -1,0 +1,128 @@
+name: Orion real-state migration rehearsal
+run-name: Orion real-state v1 ${{ inputs.attempt }}
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release containing the reviewed sanitized input
+        required: true
+        default: orion-rehearsal-input-20261112-v1
+      attempt:
+        type: choice
+        description: One primary run and at most one reviewed corrective run
+        required: true
+        options:
+          - primary
+          - corrective
+        default: primary
+      reviewed_change_commit:
+        description: Corrective runs require the reviewed current workflow commit SHA
+        required: false
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: orion-real-state-rehearsal-v1
+  cancel-in-progress: false
+jobs:
+  migrate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Enforce attempt limits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORION_ATTEMPT: ${{ inputs.attempt }}
+          ORION_REVIEWED_COMMIT: ${{ inputs.reviewed_change_commit }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          history="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/orion-real-state-rehearsal.yml/runs?per_page=100")"
+          python3 - "$ORION_ATTEMPT" "$ORION_REVIEWED_COMMIT" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$history" <<'PY'
+          import json, os, re, subprocess, sys
+          attempt, reviewed, commit, current, raw = sys.argv[1:]
+          runs=[r for r in json.loads(raw)['workflow_runs'] if str(r['id'])!=current and r['event']=='workflow_dispatch']
+          def migration_started(run):
+              jobs=json.loads(subprocess.check_output([
+                  'gh','api',f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run['id']}/jobs"
+              ],text=True))
+              return any(s['name']=='Migrate and verify the disposable state' and s.get('conclusion')!='skipped'
+                         and s.get('status') in ('in_progress','completed')
+                         for job in jobs['jobs'] for s in job.get('steps',[]))
+          runs=[r for r in runs if r['display_title'] in (
+              'Orion real-state v1 primary','Orion real-state v1 corrective') and migration_started(r)]
+          primary=[r for r in runs if r['display_title']=='Orion real-state v1 primary']
+          corrective=[r for r in runs if r['display_title']=='Orion real-state v1 corrective']
+          if attempt=='primary':
+              assert not primary and not corrective, 'Primary attempt already exists.'
+          elif attempt=='corrective':
+              assert len(primary)==1 and primary[0]['conclusion']=='failure' and not corrective, 'Corrective gate failed.'
+              assert re.fullmatch('[0-9a-f]{40}',reviewed) and reviewed==commit, 'Reviewed current commit required.'
+          else:
+              raise SystemExit('Invalid attempt')
+          print('ATTEMPT_GATE_PASS')
+          PY
+      - name: Build the pinned stock runtime
+        id: build
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          context="$RUNNER_TEMP/orion-real-build"
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$context"
+          python3 lab/release/replay.py "$context" 752decdb823486435d8884e655ecbe8fffdfa08c
+          python3 lab/real-state-migration/build.py "$context"
+          docker build --progress=plain -t orion-real-rehearsal:v1 "$context"
+      - name: Retrieve and verify the reviewed input
+        id: input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORION_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$ORION_RELEASE_TAG" =~ ^[A-Za-z0-9._-]{1,80}$ ]]
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          asset="$(jq -er --arg tag "$ORION_RELEASE_TAG" '.[] | select(.tag_name==$tag and .draft==true) | .assets[] | select(.name=="orion_sanitized_rehearsal_v1.tar.gz" and .state=="uploaded") | .id' <<<"$releases")"
+          [[ "$asset" =~ ^[0-9]+$ ]]
+          mkdir "$RUNNER_TEMP/orion-download"
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz"
+          python3 lab/real-state-migration/input.py \
+            "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz" "$RUNNER_TEMP/orion-reviewed-input"
+      - name: Migrate and verify the disposable state
+        id: migrate
+        env:
+          ORION_ATTEMPT: ${{ inputs.attempt }}
+          ORION_REVIEWED_COMMIT: ${{ inputs.reviewed_change_commit }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/orion-real-output"
+          chmod 0777 "$RUNNER_TEMP/orion-real-output"
+          docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+            --security-opt=no-new-privileges --read-only --pids-limit=512 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+            --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+            --mount "type=bind,src=$RUNNER_TEMP/orion-reviewed-input,dst=/input,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/orion-real-output,dst=/output" \
+            -e "ORION_ATTEMPT=$ORION_ATTEMPT" -e "ORION_REASON=$ORION_REVIEWED_COMMIT" \
+            orion-real-rehearsal:v1
+      - name: Summarize the result
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/orion-real-output/public/migration-report.json"
+          if [[ -f "$report" ]]; then
+            jq -r '"Result "+.result, "Input SHA-256 "+.input_sha256, "Doctor exit "+(.doctor_exit|tostring), "Failure stage "+(.failure_stage // "none"), "Failure code "+(.failure_code // "none")' "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'STOP during setup. Application migration produced no report.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain the report and verified successful output
+        if: ${{ !cancelled() && steps.migrate.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orion_real_state_rehearsal_v1_${{ inputs.attempt }}
+          path: ${{ runner.temp }}/orion-real-output/public/
+          if-no-files-found: warn
+          retention-days: 7
