@@ -66,6 +66,8 @@ def main():
     manifest = json.loads((INPUT / "manifest.json").read_text())
     report = {"result": "STOP", "input_sha256": ARCHIVE_SHA, "migrator": "2026.11.5-beta.2",
               "attempt": os.environ.get("ORION_ATTEMPT"), "correction_reason": os.environ.get("ORION_REASON", ""),
+              "migration_driver": "stock schema phase and additive admission under stock Doctor/agent maintenance ownership",
+              "doctor_cli_run": False,
               "comparison_baseline": "reviewed sanitized candidate after 14 transcript-event and 1 memory-chunk redactions",
               "sanitization_changes": manifest["changes"], "checks": {}}
     stage = "copy"
@@ -88,7 +90,8 @@ def main():
         if code:
             raise ValueError("BEFORE_VERIFICATION_FAILED")
         stage = "doctor"
-        code = run(["node", CLI, "doctor", "--fix", "--non-interactive"], "doctor", 600)
+        code = run(["node", "/opt/real-lab/schema-only.mjs"], "doctor", 600)
+        report["migration_exit"] = code
         report["doctor_exit"] = code
         report["doctor_log_sha256"] = digest(PRIVATE / "doctor.log")
         report["doctor_error_log_sha256"] = digest(PRIVATE / "doctor.stderr")

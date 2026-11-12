@@ -14,7 +14,7 @@ A separate input-download job uses contents: write because GitHub draft release 
 
 orion-real-state-rehearsal.yml runs only through workflow_dispatch. A primary migration and one reviewed corrective migration are permitted. Prior setup-only failures remain in Actions history and can be retried with a fresh dispatch. A workflow rerun is stopped at the gate. A corrective run requires exactly one failed primary migration, no prior corrective migration, and a reviewed_change_commit equal to the current workflow commit.
 
-The input-download job precedes the migration job. Dependency installation in the migration job runs before its copy of the input artifact is downloaded and extracted. The ordinary ARM64 Linux container uses the stock beta.2 tarball pinned by SHA-1 752decdb823486435d8884e655ecbe8fffdfa08c and Node 26.12.1 from the previously verified runtime recipe. There is no package instrumentation or ownership bypass.
+The input-download job precedes the migration job. Dependency installation in the migration job runs before its copy of the input artifact is downloaded and extracted. The ordinary ARM64 Linux container uses the stock beta.2 tarball pinned by SHA-1 752decdb823486435d8884e655ecbe8fffdfa08c and Node 26.12.1 from the previously verified runtime recipe. There is no package instrumentation or ownership bypass. A legacy stage builds only fictional regression fixtures for the restricted schema driver.
 
 Application commands execute as UID 10001 with networking disabled, capabilities dropped, a read-only root filesystem and writable disposable home/temp/output directories. The input mount is read-only. GitHub credentials are outside the application container.
 
@@ -22,9 +22,11 @@ The job creates a minimal canonical config declaring main and openclaw agents wi
 
 ## Verification gates
 
+Before the real input is downloaded into the migration job, a fictional regression gate runs the same schema driver. It checks refusal without Doctor ownership, both agent schema upgrades, shared schema upgrade, integrity, foreign keys, both cold snapshot records, and all original columns in session nodes, windows and transcript tables. A failed gate skips the real migration and does not consume a real migration attempt.
+
 Before migration, all three input databases must match their recorded logical fingerprints and schema versions 25/25/20. SQLite integrity and foreign-key checks must pass.
 
-The stock command doctor --fix --non-interactive runs once inside the disposable Actions container. Doctor is never invoked on DSHBox by this workflow.
+The corrective run calls the pinned stock prepareDoctorDatabaseMigrations export under withDoctorSqliteMaintenanceLock, then finishes additive schema admission under the stock agent maintenance lease. It does not run the full Doctor CLI or later session repair contributions. Both the Doctor authority and its live schema-maintenance scope are asserted before and after migration, additive admission and resource closure. All stock migration ownership checks and pre-migration backups remain active. Doctor is never invoked on DSHBox by this workflow. The legacy doctor_exit field records the driver exit for compatibility; migration_exit and doctor_cli_run identify the actual invocation.
 
 The required output versions are agent schema 38 for both agents and shared schema 36. Agent registry versions must agree. All four identity files must retain their input hashes.
 
@@ -49,3 +51,5 @@ Any application/check failure ends the attempt with STOP. Review its exact stage
 After the output archive is retrieved and verified on the phone, review the migration report and clean up the temporary draft input release. A separate explicit approval and current-state plan are required for any future production cutover.
 
 Setup run #43224148902 built the pinned runtime but stopped before migration because its read-only token could not list the draft release. Doctor was skipped and no migration attempt was consumed. The permission repair separates the input-download job from the read-only migration job. The draft asset is already uploaded and its SHA-256 matches. Status is PREPARED for a fresh primary dispatch; the permission repair has static checks but is not yet verified in Actions.
+
+Primary real-state run #43225579792 reached 38/38/36 with integrity and content/identity checks passing, but stopped on three session-table mismatches. Reopening was skipped and no migrated archive was retained. The restricted-driver correction leaves verify.mjs unchanged and is limited to the single corrective real-state attempt. See CORRECTION_v1.md for the evidence and remaining uncertainty.

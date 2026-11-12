@@ -116,6 +116,14 @@ jobs:
           python3 lab/release/replay.py "$context" 752decdb823486435d8884e655ecbe8fffdfa08c
           python3 lab/real-state-migration/build.py "$context"
           docker build --progress=plain -t orion-real-rehearsal:v1 "$context"
+      - name: Validate schema driver on fictional state
+        run: |
+          set -euo pipefail
+          docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+            --security-opt=no-new-privileges --read-only --pids-limit=512 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+            --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+            --entrypoint python3 orion-real-rehearsal:v1 /opt/real-lab/schema-selftest.py
       - name: Receive the verified reviewed archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -150,7 +158,7 @@ jobs:
           set -euo pipefail
           report="$RUNNER_TEMP/orion-real-output/public/migration-report.json"
           if [[ -f "$report" ]]; then
-            jq -r '"Result "+.result, "Input SHA-256 "+.input_sha256, "Doctor exit "+(.doctor_exit|tostring), "Failure stage "+(.failure_stage // "none"), "Failure code "+(.failure_code // "none")' "$report" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '"Result "+.result, "Input SHA-256 "+.input_sha256, "Migration exit "+((.migration_exit // .doctor_exit)|tostring), "Failure stage "+(.failure_stage // "none"), "Failure code "+(.failure_code // "none")' "$report" >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'STOP during setup. Application migration produced no report.' >> "$GITHUB_STEP_SUMMARY"
           fi
