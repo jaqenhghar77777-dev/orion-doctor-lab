@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -85,23 +87,34 @@ def validator_issues(check, gateway):
 
 def main(validate_only=False):
     os.umask(0o077)
-    base = ROOT / "gateway"
-    home = base / "home"
-    state = home / ".openclaw"
-    workspace = state / "workspace"
-    checked_workspace(workspace)
+    source = ROOT / "gateway/home/.openclaw/workspace"
+    checked_workspace(source)
     package = json.loads((CLI.parent / "package.json").read_text())
     if package["name"] != "openclaw" or package["version"] != "2026.11.5-beta.1":
         raise ValueError("unexpected OpenClaw package")
     node = shutil.which("node")
     if not node or (not validate_only and not sys.stdin.isatty()):
         raise ValueError("run from an interactive DSHBox terminal with Node installed")
-    # A separate configuration selects a provider for this turn only.
-    with tempfile.TemporaryDirectory(prefix="reply-", dir=ROOT) as tmp:
-        config = Path(tmp) / "openclaw.json"
-        original = json.loads((state / "openclaw.json").read_text())
+    # Independent state owns its own databases, config and locks. Only the five
+    # verified Markdown files enter the test workspace.
+    with tempfile.TemporaryDirectory(prefix="orion-first-turn-", dir=ROOT.parent) as tmp:
+        base = Path(tmp)
+        home = base / "home"
+        state = home / ".openclaw"
+        workspace = state / "workspace"
+        for name in HASHES:
+            dest = workspace / name
+            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(source / name, dest)
+        checked_workspace(workspace)
+        config = state / "openclaw.json"
+        with socket.socket() as port_probe:
+            port_probe.bind(("127.0.0.1", 0))
+            port = port_probe.getsockname()[1]
+        gateway = {"mode":"local","bind":"loopback","port":port,
+                   "auth":{"mode":"token","token":secrets.token_urlsafe(32)}}
         config.write_text(json.dumps({
-            "gateway":original["gateway"], "channels":{},
+            "gateway":gateway, "channels":{},
             "plugins":{"enabled":True,"allow":["openrouter"]},
             "agents":{"defaults":{"workspace":str(workspace),"model":{"primary":MODEL,"fallbacks":[]}}},
             "tools":{"allow":["read"],"fs":{"workspaceOnly":True}},
@@ -112,7 +125,9 @@ def main(validate_only=False):
                "OPENCLAW_SKIP_CHANNELS":"1","OPENCLAW_DISABLE_BONJOUR":"1","NO_COLOR":"1",
                "CI":"1","NODE_DISABLE_COMPILE_CACHE":"1"}
         for k in ("TMPDIR","XDG_CONFIG_HOME","XDG_STATE_HOME","XDG_DATA_HOME","XDG_CACHE_HOME","XDG_RUNTIME_DIR"):
-            env[k] = str(base / k.lower())
+            directory = base / k.lower()
+            directory.mkdir(mode=0o700)
+            env[k] = str(directory)
         timeout = shutil.which("timeout")
         if not timeout:
             raise ValueError("GNU timeout unavailable")
@@ -122,7 +137,7 @@ def main(validate_only=False):
         check = call(120, "config","validate","--json")
         if check.returncode:
             print(json.dumps({"result":"OPENROUTER_CONFIG_STOP", "exit":check.returncode,
-                              "issues":validator_issues(check, original["gateway"])}, indent=2))
+                              "issues":validator_issues(check, gateway)}, indent=2))
             return 1
         parsed = json.loads(check.stdout)
         if parsed.get("valid") is not True or parsed.get("path") != str(config):
@@ -143,6 +158,7 @@ def main(validate_only=False):
         run = call(360, "agent","--local","--agent","main","--model",MODEL,"--timeout","180",
                    "--message",prompt,"--json")
         checked_workspace(workspace)
+        checked_workspace(source)
         try:
             if run.returncode:
                 raise ValueError("CLI exit %d" % run.returncode)
@@ -153,7 +169,7 @@ def main(validate_only=False):
             patterns = [("KEY_REJECTED",r"\b401\b|invalid api key|no auth credentials|no api key"),
                         ("RATE_LIMIT",r"\b429\b|rate.limit"),("ACCESS_DENIED",r"\b403\b"),
                         ("NO_MODEL_ROUTE",r"no endpoints|unknown model|model not found"),
-                        ("OWNERSHIP_REFUSAL",r"offline maintenance|state lease|already running"),
+                        ("OWNERSHIP_REFUSAL",r"GatewayLockNamespaceError|cannot verify Gateway ownership|offline maintenance|state lease|already running"),
                         ("PROVIDER_UNAVAILABLE",r"\b503\b|provider unavailable")]
             label = next((tag for tag, pattern in patterns if re.search(pattern,raw,re.I)), "TURN_FAILED")
             if run.returncode in (124,137): label = "TIMEOUT"
