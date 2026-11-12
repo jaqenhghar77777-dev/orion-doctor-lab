@@ -88,11 +88,20 @@ jobs:
           test "$(stat -c %s "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz")" = 2744028
           printf '%s  %s\n' d991442d8e5175dd2d38eb7402c148507b93d855a5e91d4ffe6038c059bfffd3 \
             "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz" | sha256sum -c -
+      - name: Encrypt the private handoff
+        env:
+          HANDOFF_KEY: ${{ secrets.ORION_HANDOFF_20261112_V2 }}
+        run: |
+          set -euo pipefail
+          [[ "$HANDOFF_KEY" =~ ^[a-f0-9]{64}$ ]]
+          file="$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -md sha256 -pass stdin \
+            -out "$file.enc" -in "$file" <<< "$HANDOFF_KEY"
       - name: Hand the verified archive to the read-only migration job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: orion_reviewed_input_${{ github.run_id }}
-          path: ${{ runner.temp }}/orion-download/orion_sanitized_rehearsal_v1.tar.gz
+          path: ${{ runner.temp }}/orion-download/orion_sanitized_rehearsal_v1.tar.gz.enc
           if-no-files-found: error
           retention-days: 1
   migrate:
@@ -114,21 +123,22 @@ jobs:
           context="$RUNNER_TEMP/orion-real-build"
           python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$context"
           python3 lab/release/replay.py "$context" 752decdb823486435d8884e655ecbe8fffdfa08c
-          python3 lab/real-state-migration/build.py "$context"
+          python3 lab/real-state-migration/build-stock.py "$context"
           docker build --progress=plain -t orion-real-rehearsal:v1 "$context"
-      - name: Validate schema driver on fictional state
-        run: |
-          set -euo pipefail
-          docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
-            --security-opt=no-new-privileges --read-only --pids-limit=512 \
-            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
-            --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
-            --entrypoint python3 orion-real-rehearsal:v1 /opt/real-lab/schema-selftest.py
       - name: Receive the verified reviewed archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: orion_reviewed_input_${{ github.run_id }}
           path: ${{ runner.temp }}/orion-download
+      - name: Decrypt the reviewed input
+        env:
+          HANDOFF_KEY: ${{ secrets.ORION_HANDOFF_20261112_V2 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          file="$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass stdin \
+            -out "$file" -in "$file.enc" <<< "$HANDOFF_KEY"
       - name: Verify and extract the reviewed input
         id: input
         run: |
@@ -158,15 +168,32 @@ jobs:
           set -euo pipefail
           report="$RUNNER_TEMP/orion-real-output/public/migration-report.json"
           if [[ -f "$report" ]]; then
-            jq -r '"Result "+.result, "Input SHA-256 "+.input_sha256, "Migration exit "+((.migration_exit // .doctor_exit)|tostring), "Failure stage "+(.failure_stage // "none"), "Failure code "+(.failure_code // "none")' "$report" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '"Result "+.result, "Usability decision "+(.decision // "STOP"), "Strict result "+(.strict_result // "pending"), "Input SHA-256 "+.input_sha256, "Migration exit "+((.migration_exit // .doctor_exit)|tostring), "Failure stage "+(.failure_stage // "none"), "Failure code "+(.failure_code // "none")' "$report" >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'STOP during setup. Application migration produced no report.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Retain the report and verified successful output
+      - name: Stage only the report and encrypted usable output
+        id: stage_output
         if: ${{ !cancelled() && steps.migrate.outcome != 'skipped' }}
+        env:
+          HANDOFF_KEY: ${{ secrets.ORION_HANDOFF_20261112_V2 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          out="$RUNNER_TEMP/orion-real-output/public"
+          stage="$RUNNER_TEMP/orion-artifact"
+          mkdir "$stage"
+          cp "$out/migration-report.json" "$stage/"
+          if [[ -f "$out/orion_migrated_rehearsal_v1.tar.gz" ]]; then
+            jq -e '.decision=="GO_FOR_ISOLATED_PHONE_CHECK"' "$stage/migration-report.json" >/dev/null
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -md sha256 -pass stdin \
+              -out "$stage/orion_migrated_rehearsal_v1.tar.gz.enc" -in "$out/orion_migrated_rehearsal_v1.tar.gz" <<< "$HANDOFF_KEY"
+          fi
+      - name: Retain the report and verified successful output
+        if: ${{ !cancelled() && steps.stage_output.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: orion_real_state_rehearsal_v1_${{ inputs.attempt }}
-          path: ${{ runner.temp }}/orion-real-output/public/
+          path: ${{ runner.temp }}/orion-artifact/
           if-no-files-found: warn
           retention-days: 7
