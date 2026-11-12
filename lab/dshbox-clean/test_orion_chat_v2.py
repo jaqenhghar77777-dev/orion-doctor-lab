@@ -176,6 +176,72 @@ class Checks(unittest.TestCase):
                 self.assertEqual((test/"verification-report.json").read_bytes(),original)
                 self.assertEqual((old/"orion_chat_v2.py").exists(),variant=="line-wrap")
 
+    def test_source_ranges_handle_headers_boundaries_and_metadata(self):
+        import base64
+        from finalize_read_v3 import reconstruct
+        rows=[["old.md",1,2,base64.b64encode(MEMORY.encode()).decode()],
+              ["new.md",1,2,base64.b64encode(b"The second real excerpt describes seven violet lanterns.").decode()]]
+        note,spans=reconstruct(rows)
+        for quote,origin in [
+            (MEMORY,"body_only"),
+            ("Source \"old.md\", lines 1 to 2\n\n"+MEMORY,"body_plus_header"),
+            (note[spans[0][0]:spans[1][1]].decode(),"cross_excerpt")]:
+            result=chat.memory_quote_origin(quote,note,spans)
+            self.assertTrue(result["grounded"]);self.assertEqual(result["origin"],origin)
+        for quote in ("Historical excerpts from the reviewed local backup.",'Source "old.md", lines 1 to 2'):
+            self.assertFalse(chat.memory_quote_origin(quote,note,spans)["grounded"])
+        e=chat.tool_evidence(records(Path("/fiction"),memory=note.decode(),error=True),Path("/fiction"))
+        self.assertFalse(chat.verify_reply(answer(),e,USER,note.decode(),"fictional-proof",memory_spans=spans)["memory_excerpt_quote"])
+
+    def test_final_source_range_recheck_preserves_reports_and_uses_no_model(self):
+        import base64
+        import tarfile
+        import finalize_read_v3 as finalizer
+        for metadata_only in (False,True):
+            with self.subTest(metadata_only=metadata_only),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);old=root/"chat";source=old/"home/.openclaw/workspace"
+                test=root/"test";target=test/"home/.openclaw/workspace"
+                rows=[["fact.md",i,i+1,base64.b64encode(MEMORY.encode()).decode()] for i in range(70)]
+                note,spans=finalizer.reconstruct(rows)
+                docs={n:("identity "+n).encode() for n in helper.HASHES}
+                docs["USER.md"]=USER.encode();docs[chat.NOTE]=note
+                for workspace in (source,target):
+                    for name,body in docs.items():
+                        f=workspace/name;f.parent.mkdir(parents=True,exist_ok=True);f.write_bytes(body)
+                hashes={n:hashlib.sha256(b).hexdigest() for n,b in docs.items()}
+                (target/"read-proof.txt").write_text("fictional-proof")
+                originals={"verification-report.json":json.dumps({"result":"READ_VERIFY_STOP","test_directory":str(test),"exit":0}).encode(),
+                           "quote-verification-v2.json":b'{"result":"READ_VERIFY_STOP"}'}
+                for name,body in originals.items():(test/name).write_bytes(body)
+                quote="Historical excerpts from the reviewed local backup." if metadata_only else 'Source "fact.md", lines 0 to 1\n\n'+MEMORY
+                saved=json.loads(answer());saved["memory_fact"]=saved["memory_quote"]=quote
+                (test/"reply.txt").write_text(json.dumps(saved))
+                datafile=root/"archive.sqlite"
+                c=sqlite3.connect(datafile);c.execute("create table memory_index_chunks(chunk_rowid integer primary key,id,path,start_line,end_line,text)")
+                for i in range(70):c.execute("insert into memory_index_chunks values(?,?,?,?,?,?)",(i,str(i),"fact.md",i,i+1,MEMORY))
+                c.commit();c.close()
+                database=datafile.read_bytes();manifest=json.dumps({"files":[{"path":finalizer.MAIN,"sha256":hashlib.sha256(database).hexdigest()}]}).encode()
+                archive=root/"reviewed.tgz"
+                with tarfile.open(archive,"w:gz") as tar:
+                    for name,body in (("manifest.json",manifest),(finalizer.MAIN,database)):
+                        info=tarfile.TarInfo(name);info.size=len(body);tar.addfile(info,io.BytesIO(body))
+                audit=target.parent/"agents/main/agent/openclaw-agent.sqlite";audit.parent.mkdir(parents=True)
+                c=sqlite3.connect(audit);c.execute("create table transcript_events(session_id,seq,event_json,event_zstd)")
+                for i,event in enumerate(records(target,memory=note.decode())):
+                    c.execute("insert into transcript_events values('only-session',?,?,null)",(i,json.dumps(event)))
+                c.commit();c.close()
+                before={f:f.read_bytes() for f in old.rglob("*") if f.is_file()}
+                with patch.object(chat,"CHAT",old),patch.object(helper,"HASHES",hashes),patch.object(chat,"HASHES",hashes),patch.object(chat,"call",side_effect=AssertionError("no model request")),patch.object(finalizer,"ARCHIVE",archive),patch.object(finalizer,"ARCHIVE_HASH",hashlib.sha256(archive.read_bytes()).hexdigest()),patch.object(finalizer,"MANIFEST_HASH",hashlib.sha256(manifest).hexdigest()),contextlib.redirect_stdout(io.StringIO()) as output:
+                    rc=finalizer.finalize(test)
+                self.assertEqual(rc,1 if metadata_only else 0)
+                report=json.loads(output.getvalue())
+                self.assertEqual(report["model_requests"],0)
+                self.assertEqual(report["source_chunks_verified"],70)
+                self.assertEqual(report["quote_origin"]["origin"],"metadata_only" if metadata_only else "body_plus_header")
+                self.assertTrue(all(f.read_bytes()==b for f,b in before.items()))
+                self.assertTrue(all((test/n).read_bytes()==b for n,b in originals.items()))
+                self.assertEqual((old/"orion_chat_v2.py").exists(),not metadata_only)
+
     def test_chat_submits_one_multiline_turn_and_keeps_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);w=root/"home/.openclaw/workspace";w.mkdir(parents=True)

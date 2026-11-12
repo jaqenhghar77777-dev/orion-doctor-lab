@@ -147,7 +147,32 @@ def normalized_quote(value):
     return " ".join(value.split())
 
 
-def verify_reply(reply, evidence, user, note, nonce):
+def memory_quote_origin(quote, note, spans):
+    result = {"grounded":False,"origin":"absent","body_words":0}
+    if not isinstance(quote,str) or len(quote.strip())<16:
+        return result
+    encoded = quote.encode("utf-8")
+    start = note.find(encoded)
+    while start >= 0:
+        end = start + len(encoded)
+        intersections = [(max(start,left),min(end,right)) for left,right in spans if left<end and right>start]
+        significant = []
+        for left,right in intersections:
+            part = note[left:right].decode("utf-8")
+            words = len(re.findall(r"\w+",part))
+            if len(part.strip())>=16 and words>=4:
+                significant.append(words)
+        origin = "metadata_only" if not intersections else "cross_excerpt" if len(intersections)>1 else (
+            "body_only" if any(left<=start and end<=right for left,right in spans) else "body_plus_header")
+        candidate = {"grounded":bool(significant),"origin":origin,"body_words":max(significant,default=0)}
+        if candidate["grounded"]:
+            return candidate
+        result = candidate
+        start = note.find(encoded,start+1)
+    return result
+
+
+def verify_reply(reply, evidence, user, note, nonce, memory_spans=None):
     payload = reply.strip()
     if payload.startswith("```"):
         payload = re.sub(r"^\x60{3}(?:json)?\s*|\s*\x60{3}$","",payload,flags=re.I)
@@ -163,10 +188,13 @@ def verify_reply(reply, evidence, user, note, nonce):
     def from_read(quote, target):
         return isinstance(quote,str) and any(normalized_quote(quote) in normalized_quote(body) for body in reads.get(target,[]))
     bodies = re.split(r"\n## Excerpt \d+\n\nSource [^\n]*\n\n",note)[1:]
+    memory_match = any(quote_match(answer.get("memory_quote"),b) for b in bodies)
+    if memory_spans is not None:
+        memory_match = memory_quote_origin(answer.get("memory_quote"),note.encode("utf-8"),memory_spans)["grounded"]
     return {"reply_json":True,"user_read":"USER.md" in reads,"memory_read":NOTE in reads,
             "proof_read":"read-proof.txt" in reads,"proof_value":answer.get("proof")==nonce and any(nonce in body for body in reads.get("read-proof.txt",[])),
             "user_fact_quote":quote_match(answer.get("user_quote"),user) and from_read(answer.get("user_quote"),"USER.md"),
-            "memory_excerpt_quote":any(quote_match(answer.get("memory_quote"),b) for b in bodies) and from_read(answer.get("memory_quote"),NOTE),
+            "memory_excerpt_quote":memory_match and from_read(answer.get("memory_quote"),NOTE),
             "user_fact_identified":answer.get("user_fact")==answer.get("user_quote") and isinstance(answer.get("user_fact"),str),
             "memory_fact_identified":answer.get("memory_fact")==answer.get("memory_quote") and isinstance(answer.get("memory_fact"),str)}
 
