@@ -25,9 +25,9 @@ concurrency:
   group: orion-real-state-rehearsal-v1
   cancel-in-progress: false
 jobs:
-  migrate:
+  gate:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 35
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -65,6 +65,47 @@ jobs:
               raise SystemExit('Invalid attempt')
           print('ATTEMPT_GATE_PASS')
           PY
+  fetch_input:
+    needs: gate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download only the reviewed draft asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORION_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$ORION_RELEASE_TAG" =~ ^[A-Za-z0-9._-]{1,80}$ ]]
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          asset="$(jq -er --arg tag "$ORION_RELEASE_TAG" '[.[] | select(.tag_name==$tag and .draft==true) | .assets[] | select(.name=="orion_sanitized_rehearsal_v1.tar.gz" and .state=="uploaded")] | if length==1 then .[0].id else error("INPUT_DRAFT_ASSET_NOT_UNIQUE") end' <<<"$releases")"
+          [[ "$asset" =~ ^[0-9]+$ ]]
+          mkdir "$RUNNER_TEMP/orion-download"
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz"
+          test "$(stat -c %s "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz")" = 2744028
+          printf '%s  %s\n' d991442d8e5175dd2d38eb7402c148507b93d855a5e91d4ffe6038c059bfffd3 \
+            "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz" | sha256sum -c -
+      - name: Hand the verified archive to the read-only migration job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orion_reviewed_input_${{ github.run_id }}
+          path: ${{ runner.temp }}/orion-download/orion_sanitized_rehearsal_v1.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+  migrate:
+    needs: fetch_input
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Build the pinned stock runtime
         id: build
         run: |
@@ -75,20 +116,15 @@ jobs:
           python3 lab/release/replay.py "$context" 752decdb823486435d8884e655ecbe8fffdfa08c
           python3 lab/real-state-migration/build.py "$context"
           docker build --progress=plain -t orion-real-rehearsal:v1 "$context"
-      - name: Retrieve and verify the reviewed input
+      - name: Receive the verified reviewed archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: orion_reviewed_input_${{ github.run_id }}
+          path: ${{ runner.temp }}/orion-download
+      - name: Verify and extract the reviewed input
         id: input
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ORION_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          [[ "$ORION_RELEASE_TAG" =~ ^[A-Za-z0-9._-]{1,80}$ ]]
-          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
-          asset="$(jq -er --arg tag "$ORION_RELEASE_TAG" '.[] | select(.tag_name==$tag and .draft==true) | .assets[] | select(.name=="orion_sanitized_rehearsal_v1.tar.gz" and .state=="uploaded") | .id' <<<"$releases")"
-          [[ "$asset" =~ ^[0-9]+$ ]]
-          mkdir "$RUNNER_TEMP/orion-download"
-          gh api -H 'Accept: application/octet-stream' \
-            "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz"
           python3 lab/real-state-migration/input.py \
             "$RUNNER_TEMP/orion-download/orion_sanitized_rehearsal_v1.tar.gz" "$RUNNER_TEMP/orion-reviewed-input"
       - name: Migrate and verify the disposable state

@@ -8,13 +8,13 @@ Install and authenticate GitHub CLI in the existing DSHBox environment. Use its 
 
 After authentication, create a temporary draft release named orion-rehearsal-input-20261112-v1 in jaqenhghar77777-dev/orion-doctor-lab, targeting the reviewed workflow commit. Attach only orion_sanitized_rehearsal_v1.tar.gz. Verify the receipt checksum before upload and verify the remote asset checksum before dispatch. Publish neither the draft release nor original state.
 
-The workflow retrieves the draft asset through the repository's scoped Actions token. The input stays outside Git history. Its exact length, archive digest, manifest digest, file set and file hashes are checked before use.
+A separate input-download job uses contents: write because GitHub draft release listings require push access. That job has no checkout or application execution and performs only release reads, exact archive size/hash verification and a one-day artifact handoff. The migration job retains contents: read and actions: read. The input stays outside Git history. Its exact length, archive digest, manifest digest, file set and file hashes are checked before use.
 
 ## Manual run and attempt budget
 
 orion-real-state-rehearsal.yml runs only through workflow_dispatch. A primary migration and one reviewed corrective migration are permitted. Prior setup-only failures remain in Actions history and can be retried with a fresh dispatch. A workflow rerun is stopped at the gate. A corrective run requires exactly one failed primary migration, no prior corrective migration, and a reviewed_change_commit equal to the current workflow commit.
 
-Dependency installation runs before the input is fetched. The ordinary ARM64 Linux container uses the stock beta.2 tarball pinned by SHA-1 752decdb823486435d8884e655ecbe8fffdfa08c and Node 26.12.1 from the previously verified runtime recipe. There is no package instrumentation or ownership bypass.
+The input-download job precedes the migration job. Dependency installation in the migration job runs before its copy of the input artifact is downloaded and extracted. The ordinary ARM64 Linux container uses the stock beta.2 tarball pinned by SHA-1 752decdb823486435d8884e655ecbe8fffdfa08c and Node 26.12.1 from the previously verified runtime recipe. There is no package instrumentation or ownership bypass.
 
 Application commands execute as UID 10001 with networking disabled, capabilities dropped, a read-only root filesystem and writable disposable home/temp/output directories. The input mount is read-only. GitHub credentials are outside the application container.
 
@@ -48,4 +48,4 @@ Any application/check failure ends the attempt with STOP. Review its exact stage
 
 After the output archive is retrieved and verified on the phone, review the migration report and clean up the temporary draft input release. A separate explicit approval and current-state plan are required for any future production cutover.
 
-Status is PREPARED. Authentication, sanitized transfer and the real-state migration run are pending.
+Setup run #43224148902 built the pinned runtime but stopped before migration because its read-only token could not list the draft release. Doctor was skipped and no migration attempt was consumed. The permission repair separates the input-download job from the read-only migration job. The draft asset is already uploaded and its SHA-256 matches. Status is PREPARED for a fresh primary dispatch; the permission repair has static checks but is not yet verified in Actions.
