@@ -48,7 +48,42 @@ def result_text(data):
     raise ValueError("no assistant text in the reply")
 
 
-def main():
+def validator_issues(check, gateway):
+    secrets = [v for k, v in gateway.get("auth", {}).items()
+               if k in ("token", "password") and isinstance(v, str) and v]
+    def clean(value):
+        text = str(value)
+        for secret in secrets:
+            text = text.replace(secret, "[redacted]")
+        text = re.sub(r"(?i)\b(?:Bearer\s+|sk-or-|github_pat_|ghp_)[^\s,\"']+", "[redacted]", text)
+        text = re.sub(r"(?i)([\"']?(?:token|password|secret|api[_-]?key)[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)",
+                      r"\1[redacted]", text)
+        return " ".join(text.split())[:400]
+    issues = []
+    for stream in (check.stdout, check.stderr):
+        try:
+            data = json.loads(stream)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for issue in data.get("issues") or []:
+            if isinstance(issue, dict) and isinstance(issue.get("message"), str):
+                issues.append({"field":clean(issue.get("path") or "<root>"), "message":clean(issue["message"])})
+        if not issues:
+            error = data.get("error")
+            message = error.get("message") if isinstance(error, dict) else error
+            if isinstance(message, str):
+                issues.append({"message":clean(message)})
+    if not issues:
+        lines = (check.stderr + "\n" + check.stdout).splitlines()
+        for line in lines:
+            if re.search(r"error|invalid|denied|missing|not found|blocked|refus|failed|cannot",line,re.I):
+                issues.append({"message":clean(line)})
+    return issues[:6]
+
+
+def main(validate_only=False):
     os.umask(0o077)
     base = ROOT / "gateway"
     home = base / "home"
@@ -59,7 +94,7 @@ def main():
     if package["name"] != "openclaw" or package["version"] != "2026.11.5-beta.1":
         raise ValueError("unexpected OpenClaw package")
     node = shutil.which("node")
-    if not node or not sys.stdin.isatty():
+    if not node or (not validate_only and not sys.stdin.isatty()):
         raise ValueError("run from an interactive DSHBox terminal with Node installed")
     # A separate configuration selects a provider for this turn only.
     with tempfile.TemporaryDirectory(prefix="reply-", dir=ROOT) as tmp:
@@ -86,10 +121,15 @@ def main():
                                   cwd=home,env=env,stdin=subprocess.DEVNULL,capture_output=True,text=True)
         check = call(120, "config","validate","--json")
         if check.returncode:
-            raise ValueError("temporary OpenRouter configuration validation failed (exit %d)" % check.returncode)
+            print(json.dumps({"result":"OPENROUTER_CONFIG_STOP", "exit":check.returncode,
+                              "issues":validator_issues(check, original["gateway"])}, indent=2))
+            return 1
         parsed = json.loads(check.stdout)
         if parsed.get("valid") is not True or parsed.get("path") != str(config):
             raise ValueError("unexpected validation receipt")
+        if validate_only:
+            print("OPENROUTER_CONFIG_PASS")
+            return 0
         key = getpass.getpass("OpenRouter API key (hidden): ").strip()
         if not key:
             raise ValueError("empty key")
@@ -129,7 +169,9 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:] not in ([], ["--validate-only"]):
+            raise ValueError("expected --validate-only or no arguments")
+        sys.exit(main(validate_only=bool(sys.argv[1:])))
     except (ValueError,OSError,KeyError,EOFError) as error:
         print("OPENROUTER_STOP", error, file=sys.stderr)
         sys.exit(1)
