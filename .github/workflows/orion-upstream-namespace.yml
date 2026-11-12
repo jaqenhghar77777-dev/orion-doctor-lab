@@ -1,0 +1,39 @@
+name: Replay upstream PID probe on ARM64
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/orion-upstream-namespace.yml'
+      - 'lab/pid-namespace/**'
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build pinned beta and upstream reader variants
+        id: build
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$RUNNER_TEMP/orion-pr-base"
+          docker build --progress=plain -t orion-doctor-lab:baseline "$RUNNER_TEMP/orion-pr-base"
+          ctx="$RUNNER_TEMP/orion-pr-reader"
+          cp -r lab/pid-namespace "$ctx"
+          sha=f7ae3c617269f2779767b046979b7297f56be692
+          curl --retry 3 -fsSL "https://raw.githubusercontent.com/openclaw/openclaw/$sha/src/infra/gateway-lock-payload.ts" -o "$ctx/upstream.ts"
+          test "$(git hash-object "$ctx/upstream.ts")" = af72a74fac6f9cba849e25a9c265a7a1267f98fd
+          docker build --progress=plain -t orion-doctor-lab:upstream "$ctx"
+      - name: Exercise the beta namespace classifier
+        run: bash lab/pid-namespace/run-ci.sh probes
+      - name: Compare four Doctor migrations and repeat the upgraded case
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: bash lab/pid-namespace/run-ci.sh migrations
+      - name: Check two simultaneously running PID namespaces with hidden links
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: bash lab/pid-namespace/run-ci.sh isolation
