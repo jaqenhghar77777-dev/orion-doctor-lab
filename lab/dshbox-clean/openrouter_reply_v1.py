@@ -176,7 +176,7 @@ def main(validate_only=False):
             raise ValueError(f"{label} (exit {run.returncode})") from error
         reply = reply.replace(key,"[redacted]")
         print("\n" + reply)
-        match = re.search(r"^Memory:\s*(.+)$",reply,re.I|re.M)
+        match = re.search(r"(?:^|\s)Memory:[ \t]*(\S[^\r\n]*)$",reply,re.I|re.M)
         quote = match[1].strip().strip('"“”') if match else ""
         bodies = re.split(r"\n## Excerpt \d+\n\nSource [^\n]*\n\n",(workspace / NOTE).read_text())[1:]
         matched = len(quote) >= 12 and any(quote in body for body in bodies)
