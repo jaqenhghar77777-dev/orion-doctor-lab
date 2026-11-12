@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 const seed = process.argv[2] === 'seed';
-const prefix = seed ? '/opt/legacy' : '/opt/beta';
-const sdk = prefix+'/node_modules/openclaw/dist/plugin-sdk/';
+const installed = process.env.ORION_REHEARSAL_PACKAGE ?? (seed ? '/opt/legacy' : '/opt/beta')+'/node_modules/openclaw';
+const sdk = path.join(installed,'dist/plugin-sdk')+'/';
 const {upsertSessionEntry,getSessionEntry} = await import(sdk+'session-store-runtime.js');
 const {appendSessionTranscriptMessageByIdentity,readSessionTranscriptEvents} = await import(sdk+'session-transcript-runtime.js');
 const scope = {agentId:'main',sessionKey:'agent:main:main',sessionId:'5fd080f7-d376-483d-a065-c212db942f93',

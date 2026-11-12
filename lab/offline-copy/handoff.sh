@@ -16,6 +16,8 @@ case "$1" in
     # All OpenClaw processes have exited. Carry the complete synthetic state directory, including WALs.
     tar -C "$OPENCLAW_STATE_DIR" -cf /handoff/state.tar .
     (cd /handoff && sha256sum state.tar > state.sha256)
+    node /opt/lab/phone-export.mjs
+    chmod -R a+rX /handoff/phone-v1
     echo 'HANDOFF source=quiescent synthetic-state=archived'
     ;;
   reopen)

@@ -30,6 +30,7 @@ jobs:
           set -euo pipefail
           transfer="$(mktemp -d "$RUNNER_TEMP/orion-transfer.XXXXXX")"
           chmod 0777 "$transfer"
+          echo "ORION_TRANSFER=$transfer" >> "$GITHUB_ENV"
           for phase in prepare reopen; do
             access=rw
             if [[ "$phase" == reopen ]]; then access=ro; fi
@@ -42,3 +43,42 @@ jobs:
               orion-doctor-lab:offline /opt/lab/handoff.sh "$phase" 2>&1 | tee "$log"
             grep -E '^(RESULT|SESSION|SESSIONS|GATEWAY|DATABASES|HANDOFF) ' "$log" >> "$GITHUB_STEP_SUMMARY"
           done
+      - name: Assemble the phone ZIP and check it with the installed beta.1 and beta.2 packages
+        run: |
+          set -euo pipefail
+          artifact="$RUNNER_TEMP/orion-phone-payload"
+          mkdir "$artifact"
+          cp -R "$ORION_TRANSFER/phone-v1/." "$artifact/"
+          cp lab/offline-copy/phone.py "$artifact/__main__.py"
+          cp lab/offline-copy/session.mjs lab/pid-namespace/verify.mjs "$artifact/"
+          python3 - "$artifact" "$RUNNER_TEMP/orion_dshbox_synthetic_rehearsal_v1.zip" <<'PY'
+          from pathlib import Path
+          import sys, zipfile
+          base=Path(sys.argv[1])
+          with zipfile.ZipFile(sys.argv[2],'w',zipfile.ZIP_DEFLATED) as out:
+              for p in sorted(base.rglob('*')):
+                  if p.is_file(): out.write(p,p.relative_to(base))
+          PY
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$RUNNER_TEMP/orion-phone-beta1"
+          docker build --progress=plain -t orion-doctor-lab:phone-beta1 "$RUNNER_TEMP/orion-phone-beta1"
+          for variant in phone-beta1 offline; do
+            docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+              --security-opt=no-new-privileges --read-only --pids-limit=512 \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+              --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+              -v "$RUNNER_TEMP/orion_dshbox_synthetic_rehearsal_v1.zip:/phone.zip:ro" \
+              --entrypoint bash "orion-doctor-lab:$variant" -euc '
+                touch /home/replay/.simulate-missing-pid-link
+                python3 /phone.zip /opt/beta/node_modules/openclaw
+                node -e "const fs=require(\"node:fs\");const p=fs.readFileSync(\"/tmp/orion-replay.jsonl\",\"utf8\").trim().split(\"\\n\").map(JSON.parse).filter(x=>x.event===\"namespace\");if(!p.length||p.some(x=>x.readlink!==\"ENOENT\"||x.stat!==\"ENOENT\"))process.exit(1);console.log(\"PACKAGE_PROBES simulated-ENOENT=\"+p.length)"
+              ' | tee "$RUNNER_TEMP/orion-phone-$variant.log"
+            grep -E '^(PACKAGE |SYNTHETIC REHEARSAL|PACKAGE_PROBES)' "$RUNNER_TEMP/orion-phone-$variant.log" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Share the executable ZIP containing only the fictional fixture
+        id: phone
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orion_dshbox_synthetic_rehearsal_v1
+          path: ${{ runner.temp }}/orion-phone-payload/
+          if-no-files-found: error
+          retention-days: 30
