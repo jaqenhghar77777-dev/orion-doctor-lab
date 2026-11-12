@@ -242,6 +242,59 @@ class Checks(unittest.TestCase):
                 self.assertTrue(all((test/n).read_bytes()==b for n,b in originals.items()))
                 self.assertEqual((old/"orion_chat_v2.py").exists(),not metadata_only)
 
+    def test_targeted_body_turn_reuses_old_proof_but_requires_new_memory_read(self):
+        import verify_memory_body_v1 as targeted
+        import finalize_read_v3 as saved
+        import base64
+        for mode in ("success","metadata","no-new-read"):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);old=root/"chat";source=old/"home/.openclaw/workspace"
+                test=root/"old-test";target=test/"home/.openclaw/workspace"
+                note,spans=saved.reconstruct([["fact.md",1,2,base64.b64encode(MEMORY.encode()).decode()]])
+                docs={n:("identity "+n).encode() for n in helper.HASHES}
+                docs["USER.md"]=USER.encode();docs[chat.NOTE]=note
+                for workspace in (source,target):
+                    for name,body in docs.items():
+                        file=workspace/name;file.parent.mkdir(parents=True,exist_ok=True);file.write_bytes(body)
+                hashes={n:hashlib.sha256(b).hexdigest() for n,b in docs.items()}
+                (target/"read-proof.txt").write_text("fictional-proof")
+                originals={"verification-report.json":json.dumps({"exit":0}).encode(),
+                           "quote-verification-v2.json":b'{"result":"READ_VERIFY_STOP"}',
+                           "source-range-verification-v3.json":b'{"result":"READ_VERIFY_STOP","quote_origin":{"origin":"metadata_only"}}'}
+                for name,body in originals.items():(test/name).write_bytes(body)
+                old_answer=json.loads(answer());old_answer["memory_fact"]=old_answer["memory_quote"]="Historical excerpts from the reviewed local backup."
+                (test/"reply.txt").write_text(json.dumps(old_answer))
+                (old/"chat-session.json").write_text(json.dumps({"config":{"gateway":{"mode":"local","auth":{"token":"old-key"}},"agents":{"defaults":{"workspace":str(source)}}}}))
+                (old/"old-history.bin").write_bytes(b"saved-session-preserved")
+                def write_events(state,session,events):
+                    db=state/"agents/main/agent/openclaw-agent.sqlite";db.parent.mkdir(parents=True,exist_ok=True)
+                    c=sqlite3.connect(db);c.execute("create table transcript_events(session_id,seq,event_json,event_zstd)")
+                    for i,e in enumerate(events):c.execute("insert into transcript_events values(?,?,?,null)",(session,i,json.dumps(e)))
+                    c.commit();c.close()
+                write_events(target.parent,"old-session",records(target,memory=note.decode()))
+                before={f:f.read_bytes() for f in old.rglob("*") if f.is_file()}
+                turns=[]
+                def call(env,workspace,seconds,*args):
+                    if args[0]=="config":
+                        return subprocess.CompletedProcess(args,0,json.dumps({"valid":True}),"")
+                    turns.append(args);prompt=args[args.index("--message")+1]
+                    self.assertNotIn(MEMORY,prompt)
+                    expected_offset,_=targeted.body_line(note,spans)
+                    self.assertIn("offset="+str(expected_offset),prompt)
+                    session=args[args.index("--session-id")+1]
+                    new_records=[] if mode=="no-new-read" else records(workspace,memory=note.decode())[2:4]
+                    write_events(workspace.parent,session,new_records)
+                    quote="Historical excerpts from the reviewed local backup." if mode=="metadata" else MEMORY
+                    return subprocess.CompletedProcess(args,0,json.dumps({"payloads":[{"text":json.dumps({"memory_fact":quote,"memory_quote":quote})}]}),"")
+                with patch.object(chat,"CHAT",old),patch.object(chat,"HASHES",hashes),patch.object(helper,"HASHES",hashes),patch.object(saved,"source_spans",return_value=spans),patch.object(chat,"call",side_effect=call),patch("getpass.getpass",return_value="fixture-key"),contextlib.redirect_stdout(io.StringIO()):
+                    rc=targeted.verify(test)
+                    self.assertEqual(rc,0 if mode=="success" else 1)
+                    with self.assertRaisesRegex(ValueError,"already attempted"):targeted.verify(test)
+                self.assertEqual(len(turns),1)
+                self.assertTrue(all(f.read_bytes()==body for f,body in before.items()))
+                self.assertTrue(all((test/n).read_bytes()==body for n,body in originals.items()))
+                self.assertEqual((old/"orion_chat_v2.py").exists(),mode=="success")
+
     def test_chat_submits_one_multiline_turn_and_keeps_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);w=root/"home/.openclaw/workspace";w.mkdir(parents=True)
