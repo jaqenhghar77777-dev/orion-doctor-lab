@@ -67,12 +67,18 @@ jobs:
               --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
               --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
               -v "$RUNNER_TEMP/orion_dshbox_synthetic_rehearsal_v1.zip:/phone.zip:ro" \
+              -v "$GITHUB_WORKSPACE/lab/offline-copy/simulate-phone.cjs:/lab-sim.cjs:ro" \
+              -v "$GITHUB_WORKSPACE/lab/offline-copy/ci-node.sh:/lab-node.sh:ro" \
               --entrypoint bash "orion-doctor-lab:$variant" -euc '
                 touch /home/replay/.simulate-missing-pid-link
+                mkdir /tmp/phone-bin
+                cp /lab-node.sh /tmp/phone-bin/node
+                chmod +x /tmp/phone-bin/node
+                export PATH=/tmp/phone-bin:$PATH
                 python3 /phone.zip /opt/beta/node_modules/openclaw
-                node -e "const fs=require(\"node:fs\");const p=fs.readFileSync(\"/tmp/orion-replay.jsonl\",\"utf8\").trim().split(\"\\n\").map(JSON.parse).filter(x=>x.event===\"namespace\");if(!p.length||p.some(x=>x.readlink!==\"ENOENT\"||x.stat!==\"ENOENT\"))process.exit(1);console.log(\"PACKAGE_PROBES simulated-ENOENT=\"+p.length)"
               ' | tee "$RUNNER_TEMP/orion-phone-$variant.log"
-            grep -E '^(PACKAGE |SYNTHETIC REHEARSAL|PACKAGE_PROBES)' "$RUNNER_TEMP/orion-phone-$variant.log" >> "$GITHUB_STEP_SUMMARY"
+            grep -q '^RUNTIME .* pid-link=ENOENT$' "$RUNNER_TEMP/orion-phone-$variant.log"
+            grep -E '^(PACKAGE |RUNTIME |SYNTHETIC REHEARSAL)' "$RUNNER_TEMP/orion-phone-$variant.log" >> "$GITHUB_STEP_SUMMARY"
           done
       - name: Share the executable ZIP containing only the fictional fixture
         id: phone

@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 import shutil
 import subprocess
@@ -65,22 +66,31 @@ def run():
                    XDG_STATE_HOME=str(temp / "xdg-state"), OPENCLAW_STATE_DIR=str(state),
                    OPENCLAW_CONFIG_PATH=str(state / "openclaw.json"), ORION_REHEARSAL_PACKAGE=str(package), CI="1")
         (temp / "tmp").mkdir()
-        with zipfile.ZipFile(sys.argv[0]) as archive:
-            hashes = json.loads(archive.read("hashes.json"))
+        source = Path(sys.argv[0]).resolve()
+        with (nullcontext(None) if source.is_dir() else zipfile.ZipFile(source)) as archive:
+            def read_payload(label):
+                if archive is None:
+                    file = (source / label).resolve(strict=True)
+                    if source not in file.parents or not file.is_file() or file.stat().st_size > 64 * 1024 * 1024:
+                        raise ValueError("Unexpected extracted fixture.")
+                    return file.read_bytes()
+                info = archive.getinfo(label)
+                if info.file_size > 64 * 1024 * 1024:
+                    raise ValueError("Unexpected fixture size.")
+                return archive.read(info)
+
+            hashes = json.loads(read_payload("hashes.json"))
             if set(hashes) != FILES:
                 raise ValueError("Unexpected fixture manifest.")
             for label in sorted(FILES):
-                info = archive.getinfo("fixture/" + label)
-                if info.file_size > 64 * 1024 * 1024:
-                    raise ValueError("Unexpected fixture size.")
-                data = archive.read(info)
+                data = read_payload("fixture/" + label)
                 if hashlib.sha256(data).hexdigest() != hashes[label]:
                     raise ValueError("Fixture checksum differs.")
                 dest = state / label
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
             for script in ("verify.mjs", "session.mjs"):
-                (temp / script).write_bytes(archive.read(script))
+                (temp / script).write_bytes(read_payload(script))
         (state / "openclaw.json").write_text(json.dumps({"gateway":{"mode":"local"},"plugins":{"enabled":False}}))
 
         def call(*args, capture=False):
