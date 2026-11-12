@@ -1,0 +1,50 @@
+name: Replay published beta.2 on ARM64
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/orion-release-replay.yml'
+      - 'lab/release/**'
+permissions:
+  contents: read
+jobs:
+  stock:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify the published tarball and build the synthetic v25 replay
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          ctx="$RUNNER_TEMP/orion-stock"
+          python3 lab/custody/fixture.py .github/workflows/orion-arm64-replay.yml "$ctx"
+          data="$(curl -fsSL --retry 3 'https://registry.npmjs.org/openclaw/2026.11.5-beta.2')"
+          jq -e '.name=="openclaw" and .version=="2026.11.5-beta.2" and (.dist.integrity|startswith("sha512-"))' <<<"$data" >/dev/null
+          printf 'NPM %s\n' "$(jq -c '{version,gitHead,dist:{shasum:.dist.shasum,integrity:.dist.integrity}}' <<<"$data")"
+          python3 lab/release/replay.py "$ctx" "$(jq -r '.dist.shasum' <<<"$data")"
+          docker build --progress=plain -t orion-doctor-lab:stock "$ctx"
+      - name: Run the released CLI with the PID link present and missing
+        run: |
+          set -euo pipefail
+          status=0
+          for mode in control missing; do
+            echo "::group::$mode"
+            log="$RUNNER_TEMP/stock-$mode.log"
+            docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
+              --security-opt=no-new-privileges --read-only --pids-limit=512 \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
+              --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
+              orion-doctor-lab:stock "$mode" 2>&1 | tee "$log" || status=1
+            result="$(sed -n 's/^RESULT //p' "$log")"
+            if [[ -z "$result" ]]; then status=1
+            else
+              jq -r '"* "+.mode+" — Doctor exit "+(.doctorExit|tostring)+", agent schema "+(.before|tostring)+" → "+(.after|tostring)+", quick_check "+.integrity' <<<"$result" >> "$GITHUB_STEP_SUMMARY"
+              jq -e '.observedPidCondition and .entered and .before==25 and .integrity=="ok" and .doctorExit==0 and .after==38' <<<"$result" >/dev/null || status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
