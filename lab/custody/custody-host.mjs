@@ -20,7 +20,7 @@ function serve(message, sender) {
   if (Atomics.load(cell, 0) !== 0) return;
   const grant = grants.get(message.ticket);
   let allowed = false;
-  try { allowed = grant?.verify(message) === true; }
+  try { allowed = grant?.verify(message,sender) === true; }
   catch { allowed = false; }
   if (Atomics.compareExchange(cell, 0, 0, allowed ? 1 : 2) === 0) {
     record(allowed ? 'granted' : 'denied', grant?.kind || 'unregistered', sender);
@@ -30,7 +30,7 @@ function serve(message, sender) {
 
 // The ticket exists only while this admitted task is outstanding. Each worker
 // check goes back to the live host. A UUID present in a lock file is never a ticket.
-export function issue(databasePath, scope, assertTask, signal, kind = 'read') {
+export function issue(databasePath, scope, assertTask, signal, kind = 'read', threadId) {
   if (!isMainThread || process.platform !== 'linux' || !scope?.ownsSchemaMaintenance) return;
   const db = path.resolve(databasePath);
   let fd;
@@ -82,8 +82,9 @@ export function issue(databasePath, scope, assertTask, signal, kind = 'read') {
           assertLive();
           if (!grants.has(ticket)) throw Error('task retired');
         });
-      const verify = message => {
-        if (message.db !== db || message.ownerPath !== file || message.ownerId !== owner.ownerId ||
+      const verify = (message,sender) => {
+        if ((threadId !== undefined && sender !== threadId) ||
+            message.db !== db || message.ownerPath !== file || message.ownerId !== owner.ownerId ||
             message.hash !== signature) return false;
         recheck();
         return true;
@@ -106,4 +107,19 @@ export function issue(databasePath, scope, assertTask, signal, kind = 'read') {
     if (!grant && fd !== undefined) fs.closeSync(fd);
   }
   return grant;
+}
+
+// Bind the live broker job to the exact published shared-state backend and
+// selected worker. Its ordinary per-operation and native write checks still run.
+export function issueSqlite(db, job, request, actorUrl, expectedUrl, targetThread, assertTask) {
+  if (!job.maintenanceScope || !db || !['open','execute'].includes(request.type)) return;
+  const kind = 'sqlite-'+request.type;
+  if (actorUrl !== expectedUrl || !Number.isInteger(targetThread) || targetThread <= 0) {
+    record('outside-backend',kind,path.basename(actorUrl || 'absent'));
+    return;
+  }
+  const grant = issue(db, job.maintenanceScope, assertTask, job.signal, kind, targetThread);
+  if (!grant) return;
+  request.orionSqliteTicket = grant.ticket;
+  void job.result.then(grant.close,grant.close);
 }

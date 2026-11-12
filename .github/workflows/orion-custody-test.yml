@@ -32,6 +32,7 @@ jobs:
             echo "::group::$variant / $mode"
             if ! docker run --rm --init --hostname orion-replay --network=none --cap-drop=ALL \
                 --security-opt=no-new-privileges --read-only --pids-limit=512 \
+                --mount "type=bind,src=$GITHUB_WORKSPACE/lab/pid-namespace,dst=/opt/pr-lab,readonly" \
                 --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=2g \
                 --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=10001,gid=10001,size=2g \
                 "orion-doctor-lab:$variant" "$mode" 2>&1 | tee "$log"; then
@@ -45,6 +46,12 @@ jobs:
               if [[ -n "$result" ]]; then
                 jq -r --arg lab "$variant/$mode" '"* **"+$lab+"** — "+.outcome+" (agent schema "+(.after|tostring)+")"' <<<"$result" >> "$GITHUB_STEP_SUMMARY"
                 if ! jq -e --arg expected "$expected" '.outcome==$expected and .observedPidCondition and .integrity=="ok"' <<<"$result" >/dev/null; then status=1; fi
+                if [[ "$variant/$mode" == candidate/missing ]]; then
+                  grep -q '^REPEAT doctorExit=0 synthetic-identity=preserved$' "$log" || status=1
+                  grants="$(sed -n 's/^CUSTODY //p' "$log")"
+                  jq -e '.counts["read.granted"]>0 and .counts["sqlite-open.granted"]>0' <<<"$grants" >/dev/null || status=1
+                  grep -E '^(CUSTODY|REPEAT|DATABASES) ' "$log" >> "$GITHUB_STEP_SUMMARY" || status=1
+                fi
               else
                 echo "* $variant/$mode produced no Doctor result." >> "$GITHUB_STEP_SUMMARY"
                 status=1

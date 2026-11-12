@@ -46,22 +46,32 @@ function mint(signal=new AbortController().signal) {
 try {
   const live=mint();
   await expect('live-host-and-task',true,live.ticket);
+  const target=new Worker(new URL('./check-worker.mjs',import.meta.url),{workerData:{db,wait:true}});
+  const bound=issue(db,scope,()=>{},new AbortController().signal,'safeguard',target.threadId);
+  try {
+    assert.ok(bound);
+    await expect('different-worker-with-real-ticket',false,bound.ticket);
+    const answer=new Promise((resolve,reject)=>{ target.once('message',resolve); target.once('error',reject); });
+    target.postMessage(bound.ticket);
+    assert.deepEqual(await answer,{allowed:true});
+    console.log('SAFEGUARD assigned-worker-with-live-ticket allowed');
+  } finally { bound?.close(); await target.terminate(); }
   await expect('same-pid-without-ticket',false);
   await expect('fabricated-ticket',false,randomUUID());
   assert.equal(issue(db,undefined,()=>{},new AbortController().signal),undefined);
+  const unowned=createOpenClawDatabaseMaintenanceScope({schemaMaintenance:true});
+  try { assert.equal(issue(db,unowned,()=>{},new AbortController().signal),undefined); }
+  finally { await unowned.close(); }
+  console.log('SAFEGUARD unowned-scope-cannot-mint refused');
   fs.mkdirSync(path.dirname(otherFile),{recursive:true});
   fs.writeFileSync(otherFile,raw,{flag:'wx'});
   await expect('other-database-copied-record',false,live.ticket,other);
-  fs.renameSync(file,file+'.pinned');
-  try {
-    fs.writeFileSync(file,raw,{flag:'wx'});
-    await expect('replaced-file-identical-bytes',false,live.ticket);
-  } finally { fs.renameSync(file+'.pinned',file); }
   const cancel=new AbortController();
   const cancelled=mint(cancel.signal); cancel.abort();
   await expect('cancelled-task',false,cancelled.ticket);
   const settled=mint(); settled.close();
   await expect('settled-task',false,settled.ticket);
+  await expect('still-held-before-release',true,live.ticket);
   lease.release(); released=true;
   fs.mkdirSync(path.dirname(file),{recursive:true});
   fs.writeFileSync(file,raw,{flag:'wx'});
@@ -76,4 +86,28 @@ try {
   for(const grant of grants) grant.close();
   if(!released) lease.release();
   await scope.close();
+}
+
+// A replacement can permanently revoke its original native owner. Keep this
+// negative control independent from the release/replay and cancellation cases.
+const swapped='/home/replay/replacement/state/openclaw.sqlite';
+fs.mkdirSync(path.dirname(swapped),{recursive:true});
+fs.copyFileSync('/fixture/state/openclaw.sqlite',swapped);
+const swapOwner=acquireGatewayStateOwner({databasePath:swapped});
+const swapScope=createOpenClawDatabaseMaintenanceScope({schemaMaintenance:true,
+  assertDatabaseAccess:swapOwner.assertDatabaseAccess,assertOwnerCurrent:()=>swapOwner.assertCurrent()});
+const swapFile=resolveGatewayStateOwnerPath(swapped);
+const checked=issue(swapped,swapScope,()=>{},new AbortController().signal,'safeguard');
+assert.ok(checked);
+try {
+  await expect('still-held-before-replacement',true,checked.ticket,swapped);
+  const bytes=fs.readFileSync(swapFile);
+  fs.renameSync(swapFile,swapFile+'.pinned');
+  try {
+    fs.writeFileSync(swapFile,bytes,{flag:'wx'});
+    await expect('replaced-file-identical-bytes',false,checked.ticket,swapped);
+  } finally { fs.renameSync(swapFile+'.pinned',swapFile); }
+} finally {
+  checked.close();
+  try { await swapScope.close(); } finally { swapOwner.release(); }
 }

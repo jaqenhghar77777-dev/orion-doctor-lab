@@ -6,7 +6,7 @@ const acorn = require('acorn');
 const dist = process.argv[2] || '/opt/beta/node_modules/openclaw/dist';
 const parseOptions = {ecmaVersion:'latest', sourceType:'module', allowHashBang:true};
 const worker = 'process.getBuiltinModule("node:module").createRequire(process.execPath)("/opt/lab/custody-worker.cjs")';
-const stats = {guards:0, readWorker:0, readBroker:0};
+const stats = {guards:0, readWorker:0, readBroker:0, sqliteWorker:0, sqliteBroker:0};
 const apiNames = ['captureGatewayStateOwner','resolveGatewayStateOwnerPath','acquireGatewayStateOwner',
   'getOpenClawDatabaseMaintenanceScope','createOpenClawDatabaseMaintenanceScope','assertStateDatabaseAccessAllowed'];
 const providers = new Map();
@@ -48,6 +48,7 @@ fs.writeFileSync(path.join(__dirname,'custody-api.mjs'), [...providers].map(([n,
 
 for (const file of files) {
   const code=fs.readFileSync(file,'utf8'), bundle=path.relative(dist,file), edits=[];
+  let hostImport=false;
   const slice=n=>code.slice(n.start,n.end);
   const insert=(p,s)=>edits.push([p,p,s]);
   if (code.includes(' + orionReplayCaller(') && code.includes(' is undergoing offline maintenance by ')) {
@@ -83,7 +84,7 @@ for (const file of files) {
         n.argument.properties.some(p=>propName(p)==='task') && n.argument.properties.some(p=>propName(p)==='result')),'read result');
       const result=ret.argument.properties.find(p=>propName(p)==='result');
       const original=slice(result.value);
-      insert(0,'import { issue as orionLabIssue } from "file:///opt/lab/custody-host.mjs";\n');
+      hostImport=true;
       insert(body.start+1,'\nlet orionGrant; let orionFinished = false;\n');
       insert(send.start,'if (!orionFinished && !orionGrant) {\n' +
         'orionGrant = orionLabIssue('+context+'.admission.databasePath, '+context+'.maintenanceScope, '+authority+'.assertCurrent, '+authority+'.signal, "read");\n' +
@@ -92,6 +93,35 @@ for (const file of files) {
       stats.readBroker++;
     }
   }
+  if (path.dirname(file)===dist && file.endsWith('.mjs') &&
+      code.includes('function dispatchSqliteWorkerJob') && code.includes('stateAccess?.canonicalPath')) {
+    const nodes=[...walk(acorn.parse(code,parseOptions))];
+    for (const fn of nodes.filter(n=>n.type==='FunctionDeclaration' && /^dispatchSqliteWorkerJob(?:\$\d+)?$/.test(n.id.name))) {
+      const [slot,job]=fn.params.map(p=>p.name);
+      const inside=[...walk(fn.body)];
+      const send=unique(inside.filter(n=>n.type==='CallExpression' && n.callee.property?.name==='postMessage' &&
+        n.callee.object?.property?.name==='worker' && n.callee.object.object?.name===slot),'SQLite transport post');
+      const req=send.arguments[0].name;
+      const defined=new Set(inside.filter(n=>n.type==='VariableDeclarator').map(n=>n.id.name));
+      if(!req || !['actor','databasePath','assertDispatchable','assertStateAccess',req].every(n=>defined.has(n)))
+        throw Error('Unrecognized SQLite dispatch in '+bundle);
+      const expected=JSON.stringify(pathToFileURL(path.join(dist,'state/openclaw-state.worker.js')).href);
+      insert(send.start,'orionLabIssueSqlite(databasePath, '+job+', '+req+', actor?.moduleUrl, '+expected+', '+
+        slot+'.worker.threadId, () => { assertDispatchable(); assertStateAccess?.(); });\n');
+      hostImport=true;
+      stats.sqliteBroker++;
+    }
+  }
+  if (code.includes('SQLite worker actor is already open') && code.includes('SQLite worker module must export')) {
+    const nodes=[...walk(acorn.parse(code,parseOptions))];
+    const fn=unique(nodes.filter(n=>n.type==='FunctionDeclaration' && n.async &&
+      /^receive(?:\$\d+)?$/.test(n.id.name) && slice(n.body).includes('SQLite worker actor is already open')),'SQLite worker receiver');
+    const request=fn.params[0].name;
+    insert(fn.body.start+1,'\nreturn '+worker+'.run('+request+'.orionSqliteTicket, async () => {\n');
+    insert(fn.body.end-1,'\n});\n');
+    stats.sqliteWorker++;
+  }
+  if(hostImport) insert(0,'import { issue as orionLabIssue, issueSqlite as orionLabIssueSqlite } from "file:///opt/lab/custody-host.mjs";\n');
   if (edits.length) {
     let out=code;
     for(const [a,b,s] of edits.sort((x,y)=>y[0]-x[0])) out=out.slice(0,a)+s+out.slice(b);
@@ -99,5 +129,6 @@ for (const file of files) {
     console.log('CANDIDATE_PATCH',bundle,edits.length);
   }
 }
-if(stats.guards<2 || !stats.readWorker || !stats.readBroker) throw Error('Incomplete candidate '+JSON.stringify(stats));
+if(stats.guards<2 || !stats.readWorker || !stats.readBroker || !stats.sqliteWorker || !stats.sqliteBroker)
+  throw Error('Incomplete candidate '+JSON.stringify(stats));
 console.log('CANDIDATE_READY',JSON.stringify(stats),JSON.stringify(Object.fromEntries([...providers].map(([k,v])=>[k,path.basename(v)]))));
