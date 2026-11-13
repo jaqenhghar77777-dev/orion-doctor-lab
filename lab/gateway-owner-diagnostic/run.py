@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+from verify import check_case
 import signal
 import subprocess
 import time
@@ -92,6 +93,9 @@ ENV = {"PATH":"/usr/local/bin:/usr/bin:/bin","HOME":str(ROOT),"LANG":"C.UTF-8","
        "OPENCLAW_HOME":str(ROOT),"OPENCLAW_STATE_DIR":str(STATE),
        "OPENCLAW_CONFIG_PATH":str(STATE/"openclaw.json"),"OPENCLAW_WORKSPACE_DIR":str(WORK),
        "OPENCLAW_SKIP_CHANNELS":"1","OPENCLAW_DISABLE_BONJOUR":"1","NODE_DISABLE_COMPILE_CACHE":"1"}
+CASE = os.environ["ORION_HANDOFF_CASE"]
+ENV["ORION_HANDOFF_CASE"] = CASE
+REPORT["case"] = CASE
 for name in ("TMPDIR","XDG_CONFIG_HOME","XDG_STATE_HOME","XDG_DATA_HOME","XDG_RUNTIME_DIR","XDG_CACHE_HOME"):
     d=ROOT/name.lower()
     d.mkdir()
@@ -161,7 +165,7 @@ try:
     found=False
     while time.monotonic()<deadline:
         traces=trace_rows()
-        if any(t["event"]=="refusal" for t in traces) or tui.poll() is not None:
+        if any(t["event"] in ("refusal","receipt-rejected") for t in traces) or tui.poll() is not None:
             break
         if (ROOT/"model-count.txt").exists():
             history=call("gateway","call","chat.history","--timeout","15000","--json",
@@ -181,7 +185,10 @@ finally:
         stop(p)
     traces=trace_rows()
     for t in traces:
-        print("ORION_TRACE "+json.dumps(t),flush=True)
+        if (t.get("message","").startswith(("Live input","Submitted input"))
+            or t["event"] in ("handoff","chat-send")
+            or (t["event"]=="reader" and any("prepareForeignLiveSessionPendingInputEntries" in line for line in t["caller"]))):
+            print("ORION_TRACE "+json.dumps(t),flush=True)
     REPORT["send_calls"]=sum(t["event"]=="chat-send" for t in traces)
     REPORT["trace_count"]=len(traces)
     raw=gateway_log.read_text(errors="replace") if gateway_log.exists() else ""
@@ -208,6 +215,5 @@ finally:
         except (ValueError,OSError,subprocess.SubprocessError) as e:
             REPORT["inspection_error"]=type(e).__name__
     print("ORION_DIAGNOSTIC_RESULT "+json.dumps(REPORT),flush=True)
-    found_refusal = any(t.get("event")=="refusal" and t.get("message")=="Live input changed its captured database owner" for t in traces)
-    if REPORT["send_calls"] != 1 or (not found_refusal and REPORT["result"]!="FICTIONAL_CONVERSATION_PASS"):
-        raise SystemExit(1)
+    check_case(CASE, REPORT, traces)
+    print("VERIFIED_HANDOFF_CASE "+CASE,flush=True)

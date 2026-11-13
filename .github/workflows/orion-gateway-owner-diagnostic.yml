@@ -1,7 +1,7 @@
-name: Fictional Gateway owner diagnosis
+name: Fictional first-message handoff matrix
 on:
   push:
-    branches: [orion-first-tui-trace-20261113-v1]
+    branches: [orion-handoff-matrix-20261114-v1]
     paths: ['.github/workflows/orion-gateway-owner-diagnostic.yml']
 permissions:
   contents: read
@@ -18,6 +18,30 @@ jobs:
           persist-credentials: false
       - name: Build pinned beta.1 with observation statements
         run: docker build --progress=plain -t orion-owner-diagnostic lab/gateway-owner-diagnostic
-      - name: One create and one message with a local fictional model
+      - name: Eight isolated first messages, one per predefined case
         run: |
-          docker run --rm --init --network=none --cap-drop=ALL --security-opt=no-new-privileges             --read-only --pids-limit=512             --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=1g             --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=1g             orion-owner-diagnostic
+          modes=(control no-reader prepared alias other-file revoked late-sibling stable-handoff)
+          pids=()
+          failed=0
+          run_case() {
+            local mode="$1"
+            docker run --rm --init --network=none --cap-drop=ALL --security-opt=no-new-privileges \
+              --read-only --pids-limit=512 \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=1g \
+              --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=1g \
+              -e ORION_HANDOFF_CASE="$mode" orion-owner-diagnostic > "$RUNNER_TEMP/$mode.log" 2>&1
+          }
+          for mode in "${modes[@]}"; do
+            run_case "$mode" &
+            pids+=("$!")
+            if (( ${#pids[@]} == 2 )); then
+              for p in "${pids[@]}"; do wait "$p" || failed=1; done
+              pids=()
+            fi
+          done
+          for mode in "${modes[@]}"; do
+            echo "::group::$mode"
+            cat "$RUNNER_TEMP/$mode.log"
+            echo "::endgroup::"
+          done
+          exit "$failed"

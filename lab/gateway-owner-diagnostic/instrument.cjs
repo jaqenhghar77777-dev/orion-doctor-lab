@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const {execFileSync} = require('node:child_process');
 const dist = process.argv[2] || '/opt/beta/node_modules/openclaw/dist';
 const modules = [
+  ['attempt-DAQ6s3gQ.mjs','9db03aa43fb1afdb572efb9ffd57d9d32ea93e299b335097fac8c95d8014533f','producer'],
   ['session-accessor--Bmf8-N6.mjs','01ae682ed9af10a21aea941fc29dbc2762f4dd86c000c60a9ae0b3e3c50abe83','guard'],
   ['session-accessor.sqlite-read-scope-yZ5VOObI.mjs','e33b632bab3a4ccd58246a33061179c29edfe03c004aa85c859bdf1c8d13801d','reader'],
   ['config/sessions/transcript-session-accessor.sqlite-read-scope-BBOz-FqW.mjs','6f5ed4dfb781f40f960b106efc68d37d667be55fa84603142e88ed025af71b04','reader'],
@@ -35,9 +36,22 @@ for (const [file, expected, kind] of modules) {
     edits.push([anchor, anchor+'\n'+observation]);
   }
   if (kind === 'guard') {
+    const capture = 'captureSessionStoreReadTarget(captured, "Live input changed its captured database owner")';
+    edits.push([capture,capture.replace('captured,','labCaptureInput(captured),')]);
+    const resolution = 'const resolved = await prepareSqliteTranscriptReadScope(captured, signal);';
+    edits.push([resolution,`const readerResolution = await prepareSqliteTranscriptReadScope(captured, signal);
+const resolved = labAfterDiscovery(readerResolution, labInvalidate);
+orionEmit('handoff',{mode:process.env.ORION_HANDOFF_CASE, original:readerResolution.path??null,
+  supplied:resolved.path??null, prior:orionPhysical(readerResolution.path), next:orionPhysical(resolved.path),
+  sessionKey:captured.sessionKey,sessionId:captured.sessionId});`]);
+    const current = 'prepared.assertCurrent();';
+    edits.push([current,`try { ${current} } catch (error) {
+  orionEmit('receipt-rejected',{id:orionId,message:changedMessage,reason:error.message}); throw error;
+}
+orionEmit('receipt-current',{id:orionId,message:changedMessage});`]);
     const a='const identities = captureSessionStoreCandidateIdentities(candidates);\n\treturn { resolve(resolved) {';
     edits.push([a, a.replace('\n\treturn', `\nconst orionId = process.hrtime.bigint().toString();
-orionEmit('capture',{id:orionId,message:changedMessage,input:scope.storePath??null,storePath,agent:toDatabaseOptions(logical).agentId,observed:orionPhysical(storePath),prepared:prepared?{canonical:prepared.canonicalPath,agent:prepared.validation.agentId,key:prepared.validation.identity,birthtime:prepared.validation.birthtime}:null,candidates:candidates.map(c=>({path:c.path,physical:c.physicalPath,scope:c.scope??null})),identities:[...identities]});
+orionEmit('capture',{id:orionId,message:changedMessage,sessionKey:scope.sessionKey,sessionId:scope.sessionId,input:scope.storePath??null,storePath,agent:toDatabaseOptions(logical).agentId,observed:orionPhysical(storePath),prepared:prepared?{canonical:prepared.canonicalPath,agent:prepared.validation.agentId,key:prepared.validation.identity,birthtime:prepared.validation.birthtime}:null,candidates:candidates.map(c=>({path:c.path,physical:c.physicalPath,scope:c.scope??null})),identities:[...identities]});
 \treturn`)]);
     const a2='const identity = prepared ? {\n\t\t\tkey: `file:${prepared.validation.identity}`,';
     edits.push([a2,`orionEmit('resolved',{id:orionId,message:changedMessage,path:options.path,agent:options.agentId,observed:orionPhysical(options.path)});\n`+a2]);
@@ -45,9 +59,12 @@ orionEmit('capture',{id:orionId,message:changedMessage,input:scope.storePath??nu
       const before='if ('+condition+') throw new Error(changedMessage);';
       edits.push([before,'if ('+condition+') { orionEmit("refusal",{id:orionId,message:changedMessage,branch:"'+branch+'",stack:new Error().stack?.split("\\n").slice(2,10)}); throw new Error(changedMessage); }']);
     }
+  } else if (kind === 'producer') {
+    const anchor='sessionReader: getReplyOperationSessionReader(replyOperation),';
+    edits.push([anchor,"sessionReader: process.env.ORION_HANDOFF_CASE === 'no-reader' ? undefined : getReplyOperationSessionReader(replyOperation),"]);
   } else if (kind === 'reader') {
     after('const reader = getOwnedSessionTranscriptReader(readScope);',
-      `orionEmit('reader',{selected:!!reader,input:readScope.storePath??null,agent:readScope.agentId??null,path:reader?.database.path??null,dbAgent:reader?.database.agentId??null,caller:new Error().stack?.split('\\n').slice(2,5)});`);
+      `orionEmit('reader',{selected:!!reader,sessionKey:readScope.sessionKey,sessionId:readScope.sessionId,input:readScope.storePath??null,agent:readScope.agentId??null,path:reader?.database.path??null,dbAgent:reader?.database.agentId??null,caller:new Error().stack?.split('\\n').slice(2,5)});`);
   } else {
     after('async function handleChatSend(options, onAdmissionOwned, externalAuthorityAdmission) {',
       "orionEmit('chat-send',{});");
@@ -60,7 +77,11 @@ orionEmit('capture',{id:orionId,message:changedMessage,input:scope.storePath??nu
   let inverse=source;
   for (const [a,b] of [...edits].reverse()) inverse=inverse.replace(b,()=>a);
   if(inverse!==original) throw Error('Instrumentation did not round-trip');
-  fs.writeFileSync(name,prelude+source);
+  const fixtureImports = kind === 'guard'
+    ? "import { captureInput as labCaptureInput, afterDiscovery as labAfterDiscovery } from '/opt/lab/handoff-fixture.mjs';\n"+
+      "import { m as labInvalidate } from './openclaw-agent-db-validation-cache-BfwZhfiV.mjs';\n"
+    : '';
+  fs.writeFileSync(name,fixtureImports+prelude+source);
   execFileSync(process.execPath,['--check',name]);
   console.log('PIN_AND_REVERSIBLE_TRACE_OK '+file);
 }
