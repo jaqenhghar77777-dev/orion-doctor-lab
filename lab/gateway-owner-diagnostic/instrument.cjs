@@ -20,11 +20,15 @@ function visit(dir) {
    const records=[
     ['const identities = captureSessionStoreCandidateIdentities(candidates);',
      'const identities = captureSessionStoreCandidateIdentities(candidates);\n'+trace('{event:"capture",message:changedMessage,storePath,logicalPath:logical.path??null,prepared:!!prepared,canonical:prepared?.canonicalPath??null,candidates:candidates.map(c=>({path:c.path,physical:c.physicalPath,scope:c.scope??null})),identityPaths:[...identities.keys()]}'),'capture'],
-    ['if (!identity) {','if (!identity) {\n'+trace('{event:"refusal",branch:"missing-candidate-identity",message:changedMessage,captured:storePath,resolved:options.path,prepared:!!prepared}'),'missing'],
-    ['if (options.path !== prepared.canonicalPath) {','if (options.path !== prepared.canonicalPath) {\n'+trace('{event:"refusal",branch:"prepared-path-differs",message:changedMessage,captured:storePath,canonical:prepared.canonicalPath,resolved:options.path}'),'prepared'],
     ['const identity = prepared',''+trace('{event:"resolved",message:changedMessage,captured:storePath,resolved:options.path,samePath:storePath===options.path,prepared:!!prepared,agent:options.agentId}')+'const identity = prepared','resolved']
    ];
    for(const [a,b,label] of records)s=change(s,a,b,label);
+   let branchIndex=0;
+   s=s.replaceAll('throw new Error(changedMessage);', () => {
+    const branch=branchIndex++===0?'missing-candidate-identity':'prepared-path-differs';
+    return '{'+trace('{event:"refusal",branch:'+JSON.stringify(branch)+',message:changedMessage,captured:storePath,resolved:options.path,prepared:!!prepared,canonical:prepared?.canonicalPath??null}')+'throw new Error(changedMessage);}';
+   });
+   if(branchIndex!==2)throw Error('expected two guard throws');
    if((s.match(/throw new Error\(changedMessage\)/g)||[]).length!==2)throw Error('guard altered');
    source=source.slice(0,start)+s+source.slice(end); kinds.push('guard');
   }
