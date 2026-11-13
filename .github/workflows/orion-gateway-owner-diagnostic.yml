@@ -1,9 +1,6 @@
 name: Fictional Gateway owner diagnosis
 on:
-  push:
-    paths:
-      - '.github/workflows/orion-gateway-owner-diagnostic.yml'
-      - 'lab/gateway-owner-diagnostic/**'
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:

@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import sqlite3
 import subprocess
 import time
 import uuid
@@ -151,10 +150,22 @@ finally:
     REPORT["traces"]=traces
     REPORT["model_requests"]=len((ROOT/"model-count.txt").read_text().splitlines()) if (ROOT/"model-count.txt").exists() else 0
     dbfile=STATE/"agents/main/agent/openclaw-agent.sqlite"
+    # Emit captured evidence before any optional post-run database inspection.
+    print("ORION_DIAGNOSTIC_CAPTURE "+json.dumps(REPORT),flush=True)
     if dbfile.exists():
-        with sqlite3.connect("file:"+str(dbfile)+"?mode=ro",uri=True) as db:
-            REPORT["integrity"]=db.execute("PRAGMA integrity_check").fetchone()[0]
-            REPORT["sessions"]=db.execute("SELECT count(*) FROM session_nodes").fetchone()[0]
+        try:
+            probe = subprocess.run(["node","--no-warnings","--input-type=commonjs","-e",
+                "const {DatabaseSync}=require('node:sqlite');"
+                "const db=new DatabaseSync(process.argv[1],{readOnly:true});"
+                "try{console.log(JSON.stringify({integrity:db.prepare('PRAGMA integrity_check').get(),"
+                "sessions:db.prepare('SELECT count(*) AS n FROM session_nodes').get().n}))}"
+                "finally{db.close()}", str(dbfile)], env=ENV, capture_output=True,text=True,timeout=30)
+            if probe.returncode:
+                REPORT["inspection_error"]="Node SQLite inspection exited "+str(probe.returncode)
+            else:
+                REPORT["database_inspection"]=json.loads(probe.stdout)
+        except (ValueError,OSError,subprocess.SubprocessError) as e:
+            REPORT["inspection_error"]=type(e).__name__
     if REPORT["result"]=="STOP" or REPORT["result"]=="OWNER_FAILURE_OR_INCOMPLETE":
         REPORT["log_tail"]=raw[-6000:].replace("fictional-gateway-token","[token]").replace("fictional-model-key","[key]")
     print("ORION_DIAGNOSTIC_RESULT "+json.dumps(REPORT),flush=True)
