@@ -1,0 +1,24 @@
+name: Fictional Gateway owner diagnosis
+on:
+  push:
+    paths:
+      - '.github/workflows/orion-gateway-owner-diagnostic.yml'
+      - 'lab/gateway-owner-diagnostic/**'
+permissions:
+  contents: read
+concurrency:
+  group: orion-gateway-owner-diagnostic-once
+  cancel-in-progress: false
+jobs:
+  fictional:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build pinned beta.1 with observation statements
+        run: docker build --progress=plain -t orion-owner-diagnostic lab/gateway-owner-diagnostic
+      - name: One create and one message with a local fictional model
+        run: |
+          docker run --rm --init --network=none --cap-drop=ALL --security-opt=no-new-privileges             --read-only --pids-limit=512             --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=1g             --tmpfs /home/replay:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=1g             orion-owner-diagnostic
