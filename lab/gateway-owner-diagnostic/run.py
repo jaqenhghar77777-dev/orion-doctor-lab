@@ -6,7 +6,11 @@ from pathlib import Path
 import signal
 import subprocess
 import time
-import uuid
+import pty
+import fcntl
+import struct
+import termios
+import threading
 
 ROOT = Path("/home/replay")
 STATE = ROOT / ".openclaw"
@@ -58,6 +62,29 @@ def stop(p):
 
 
 os.umask(0o077)
+def trace_rows():
+    f = ROOT / "trace.jsonl"
+    return [json.loads(line) for line in f.read_text().splitlines()] if f.exists() else []
+
+
+def isolation():
+    mounts = {parts[4]:parts for line in Path("/proc/self/mountinfo").read_text().splitlines()
+              if (parts := line.split())}
+    assert os.uname().machine == "aarch64" and os.geteuid() == 1000
+    assert "ro" in mounts["/"][5].split(",")
+    assert mounts[str(ROOT)][mounts[str(ROOT)].index("-")+1] == "tmpfs"
+    assert set(os.listdir("/sys/class/net")) == {"lo"}
+    assert not any(ROOT.iterdir())
+    assert not STATE.exists()
+    assert Path("/proc/self/status").read_text().split("CapEff:")[1].split()[0] == "0000000000000000"
+    REPORT["isolation"] = "ARM64, uid 1000, read-only root, empty tmpfs home, only loopback, zero effective capabilities"
+    try:
+        REPORT["pid_ns_link"] = os.readlink("/proc/self/ns/pid")
+    except OSError as exc:
+        REPORT["pid_ns_errno"] = exc.errno
+
+
+isolation()
 WORK = STATE / "workspace"
 WORK.mkdir(parents=True)
 (WORK/"SOUL.md").write_text("You are a fictional test assistant. Reply briefly.\n")
@@ -110,27 +137,40 @@ try:
         raise RuntimeError("unexpected session creation response")
     REPORT["created"]=True
     key=created["key"]
-    REPORT["stage"]="chat-send"
-    REPORT["send_calls"]=1
-    sent=call("gateway","call","chat.send","--timeout","90000","--json","--params",
-              json.dumps({"sessionKey":key,"message":"Reply with ORION-FICTIONAL-OK.",
-                          "idempotencyKey":str(uuid.uuid4())}))
-    REPORT["send_status"]=sent.get("status")
-    REPORT["stage"]="history-read"
-    deadline=time.monotonic()+90
+    REPORT["stage"]="first-tui-message"
+    master, slave=pty.openpty()
+    fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack("HHHH",40,140,0,0))
+    tui=subprocess.Popen(["node",CLI,"tui","--session",key,"--timeout-ms","60000",
+        "--message","Give the fictional test response."],stdin=slave,stdout=slave,stderr=slave,
+        cwd=WORK,env=ENV,start_new_session=True)
+    children.append(tui)
+    os.close(slave)
+    def drain():
+        with (ROOT/"terminal.bin").open("wb") as dest:
+            try:
+                while True:
+                    data=os.read(master,65536)
+                    if not data:
+                        break
+                    dest.write(data)
+                    dest.flush()
+            except OSError:
+                pass
+    threading.Thread(target=drain,daemon=True).start()
+    deadline=time.monotonic()+95
     found=False
     while time.monotonic()<deadline:
-        history=call("gateway","call","chat.history","--timeout","15000","--json",
-                     "--params",json.dumps({"sessionKey":key,"limit":10}),seconds=25)
-        for m in history.get("messages",[]):
-            if m.get("role")=="assistant" and "ORION-FICTIONAL-OK" in json.dumps(m.get("content")):
-                found=True
-        if found:
+        traces=trace_rows()
+        if any(t["event"]=="refusal" for t in traces) or tui.poll() is not None:
             break
-        raw=gateway_log.read_text(errors="replace")
-        if '"event":"refusal"' in raw:
-            break
-        time.sleep(2)
+        if (ROOT/"model-count.txt").exists():
+            history=call("gateway","call","chat.history","--timeout","15000","--json",
+                         "--params",json.dumps({"sessionKey":key,"limit":10}),seconds=25)
+            found=any(m.get("role")=="assistant" and "ORION-FICTIONAL-OK" in json.dumps(m.get("content"))
+                      for m in history.get("messages",[]))
+            if found:
+                break
+        time.sleep(0.5)
     REPORT["assistant_marker_in_history"]=found
     REPORT["result"]="FICTIONAL_CONVERSATION_PASS" if found else "OWNER_FAILURE_OR_INCOMPLETE"
 except Exception as e:
@@ -139,15 +179,16 @@ except Exception as e:
 finally:
     for p in reversed(children):
         stop(p)
-    traces=[]
+    traces=trace_rows()
+    for t in traces:
+        print("ORION_TRACE "+json.dumps(t),flush=True)
+    REPORT["send_calls"]=sum(t["event"]=="chat-send" for t in traces)
+    REPORT["trace_count"]=len(traces)
     raw=gateway_log.read_text(errors="replace") if gateway_log.exists() else ""
-    for line in raw.splitlines():
-        if line.startswith("ORION_OWNER_TRACE "):
-            try:
-                traces.append(json.loads(line.split(" ",1)[1]))
-            except ValueError:
-                pass
-    REPORT["traces"]=traces
+    terminal=(ROOT/"terminal.bin").read_bytes().decode(errors="replace").lower() if (ROOT/"terminal.bin").exists() else ""
+    marks=["gateway connected","initial message not sent","pairing required","unauthorized","captured database owner","connection failed","not ready","unknown model","offline maintenance"]
+    REPORT["terminal_markers"]=[mark for mark in marks if mark in terminal]
+    REPORT["gateway_markers"]=[mark for mark in marks if mark in raw.lower()]
     REPORT["model_requests"]=len((ROOT/"model-count.txt").read_text().splitlines()) if (ROOT/"model-count.txt").exists() else 0
     dbfile=STATE/"agents/main/agent/openclaw-agent.sqlite"
     # Emit captured evidence before any optional post-run database inspection.
@@ -166,8 +207,7 @@ finally:
                 REPORT["database_inspection"]=json.loads(probe.stdout)
         except (ValueError,OSError,subprocess.SubprocessError) as e:
             REPORT["inspection_error"]=type(e).__name__
-    if REPORT["result"]=="STOP" or REPORT["result"]=="OWNER_FAILURE_OR_INCOMPLETE":
-        REPORT["log_tail"]=raw[-6000:].replace("fictional-gateway-token","[token]").replace("fictional-model-key","[key]")
     print("ORION_DIAGNOSTIC_RESULT "+json.dumps(REPORT),flush=True)
-    if REPORT["result"]!="FICTIONAL_CONVERSATION_PASS" and not any(t.get("event")=="refusal" for t in traces):
+    found_refusal = any(t.get("event")=="refusal" and t.get("message")=="Live input changed its captured database owner" for t in traces)
+    if REPORT["send_calls"] != 1 or (not found_refusal and REPORT["result"]!="FICTIONAL_CONVERSATION_PASS"):
         raise SystemExit(1)

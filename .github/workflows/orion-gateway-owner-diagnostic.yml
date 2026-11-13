@@ -1,6 +1,8 @@
 name: Fictional Gateway owner diagnosis
 on:
-  workflow_dispatch:
+  push:
+    branches: [orion-first-tui-trace-20261113-v1]
+    paths: ['.github/workflows/orion-gateway-owner-diagnostic.yml']
 permissions:
   contents: read
 concurrency:
